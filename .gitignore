@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+norge_cache.db
+lovdata_cache/
+*.tar.bz2
