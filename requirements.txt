@@ -1,0 +1,37 @@
+# MCP-server — Stortinget, Lovdata, regjeringen.no
+# Installera: pip install -r requirements.txt
+
+# MCP-server
+mcp>=1.0.0
+
+# HTTP-anrop mot Stortingets API och regjeringen.no
+httpx>=0.27.0
+
+# XML-parsning (Stortingets publikasjoner)
+lxml>=5.0.0
+
+# HTML-parsning (Lovdata bulk — HTML med .xml-extension)
+beautifulsoup4>=4.12.0
+
+# Konfiguration via .env
+python-dotenv>=1.0.0
+
+# Databas — välj PostgreSQL eller SQLite:
+# PostgreSQL (krävs för pgvector-sökning):
+psycopg2-binary>=2.9.0
+# SQLite (utan pgvector — semantisk sökning kräver Postgres):
+# sqlite-vec installeras separat: pip install sqlite-vec
+
+# HTTP-transport (krävs för MCP_TRANSPORT=http)
+starlette>=0.40.0
+uvicorn>=0.30.0
+
+# Lovdata bulk — tarball-hantering via stdlib (tarfile, bz2), inga extra paket
+
+# regjeringen.no PDF-pipeline
+pymupdf4llm>=0.0.17
+# ocrmypdf>=16.0.0   # OCR-fallback — kräver tesseract-ocr + nob-språkpaket
+
+# Semantisk sökning och termexpansion
+sentence-transformers>=3.0.0
+openai>=1.0.0
