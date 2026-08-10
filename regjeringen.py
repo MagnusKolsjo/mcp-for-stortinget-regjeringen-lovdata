@@ -23,7 +23,7 @@ URL-format som hanteras:
   //www.regjeringen.no/id/...       (protokollrelativ)
   https://www.regjeringen.no/no/dokumenter/<DOK_SLUG>/id<DOC_ID>/
 
-Återanvänder FD-1-skyddsmönstret från arbetsström 9 (pdf_lib.py) för att
+Använder FD-1-skydd för att
 hindra pymupdf4llm:s C-backends från att skriva på FD 1 (MCP-protokollet).
 """
 
@@ -59,7 +59,7 @@ _SESSION = httpx.Client(
 
 
 # ---------------------------------------------------------------------------
-# FD-1-skydd (kopierat från ström 9 pdf_lib.py)
+# FD-1-skydd
 # ---------------------------------------------------------------------------
 
 @contextlib.contextmanager
@@ -114,13 +114,44 @@ def _normaliser_url(url: str) -> str:
 # HTML-hämtning och PDF-URL-extraktion
 # ---------------------------------------------------------------------------
 
+class BotskyddFel(Exception):
+    """
+    regjeringen.no avvisade anropet med en bot-kontroll.
+
+    Sedan 2026-08 ligger hela domänen bakom en Cloudflare JS-challenge som
+    svarar HTTP 403 på varje förfrågan — även förstasidan och robots.txt.
+    Kontrollen är oberoende av User-Agent och kan inte passeras av en
+    HTTP-klient. Undantaget skiljer detta från vanliga hämtningsfel så att
+    verktygen kan förklara läget i stället för att rapportera ett rått 403.
+    """
+
+
 def hamta_html(url: str) -> tuple[str, str]:
     """
     Hämtar HTML-sidan för ett dokument. Returnerar (html_text, final_url).
     Följer omdirigeringar automatiskt.
+
+    Kastar BotskyddFel när källan svarar med en Cloudflare-utmaning.
     """
     norm_url = _normaliser_url(url)
     r = _SESSION.get(norm_url)
+
+    if r.status_code == 403 and (
+        r.headers.get("cf-mitigated") == "challenge"
+        or "cloudflare" in r.headers.get("server", "").lower()
+    ):
+        raise BotskyddFel(
+            "regjeringen.no avvisar automatiserad åtkomst med en Cloudflare-"
+            "utmaning (HTTP 403, cf-mitigated: challenge). Kontrollen gäller hela "
+            "domänen och är oberoende av User-Agent, så dokumentet kan inte "
+            "hämtas härifrån. Vägar vidare: (1) Stortingets innstilling och "
+            "referat i samma sak återger propositionens innehåll utförligt och "
+            "är fritt tillgängliga — använd nor_lista_publikasjoner(sakid) och "
+            "hämta innstillingen; (2) dokument som redan ligger i den lokala "
+            "cachen nås oförändrat via nor_sok och nor_sok_i_dokument. "
+            "Långsiktig åtgärd är en vitlistningsbegäran hos DSS."
+        )
+
     r.raise_for_status()
     return r.text, str(r.url)
 
@@ -328,10 +359,22 @@ def hamta_og_ekstraher(url: str) -> dict:
         log.info("regjeringen.no OK: %s (%d tecken)", metadata.get("beteckning") or url, len(fulltext))
         return {**metadata, "fulltext_md": fulltext, "fel": None}
 
+    except BotskyddFel as exc:
+        # Källan blockerar all automatiserad åtkomst — inte ett fel i hämtningen.
+        # Märks med egen felkod så anroparen kan skilja det från nätverksfel.
+        log.warning("regjeringen.no blockerar automatiserad åtkomst (%s)", url)
+        return {
+            "tittel": "", "beteckning": "", "dok_type": "proposisjon",
+            "url": url, "pdf_url": None, "fulltext_md": None,
+            "fel_typ": "kalla_blockerar_automatiserad_atkomst",
+            "fel": str(exc),
+        }
+
     except Exception as exc:
         log.error("hamta_og_ekstraher misslyckades (%s): %s", url, exc)
         return {
             "tittel": "", "beteckning": "", "dok_type": "proposisjon",
             "url": url, "pdf_url": None, "fulltext_md": None,
+            "fel_typ": "hamtningsfel",
             "fel": str(exc),
         }

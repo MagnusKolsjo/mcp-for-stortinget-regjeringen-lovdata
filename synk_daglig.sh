@@ -38,9 +38,14 @@ echo "[$(date '+%H:%M:%S')] Steg 1 klar" >> "$LOGG"
 
 # ---------------------------------------------------------------------------
 # Steg 2: Chunkning + embedding för nya/uppdaterade dokument
+#
+# Alla källor embeddas, inte bara Lovdata. Stortinget- och regjeringen-dokument
+# hamnar i cachen när de hämtas via MCP-verktygen, men fick tidigare aldrig
+# några vektorer — vilket gjorde att semantisk sökning mot dem alltid gav noll
+# träffar utan att det framgick varför.
 # ---------------------------------------------------------------------------
 echo "[$(date '+%H:%M:%S')] Steg 2: Chunkning och embedding" >> "$LOGG"
-"$PYTHON" "$MAPP/nor_embedding.py" --kilde lovdata >> "$LOGG" 2>&1
+"$PYTHON" "$MAPP/nor_embedding.py" --kilde alla >> "$LOGG" 2>&1
 echo "[$(date '+%H:%M:%S')] Steg 2 klar" >> "$LOGG"
 
 echo "Daglig synk avslutad: $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOGG"

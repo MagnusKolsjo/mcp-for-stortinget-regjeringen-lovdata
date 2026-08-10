@@ -4,7 +4,7 @@
 -- Kräver: CREATE EXTENSION vector; (pgvector installerat)
 --
 -- Tabellerna placeras i schemat norge för att undvika kollisioner med
--- andra arbetsströmmar som delar samma PostgreSQL-instans.
+-- andra MCP-servrar som delar samma PostgreSQL-instans.
 -- =============================================================================
 
 CREATE EXTENSION IF NOT EXISTS vector;

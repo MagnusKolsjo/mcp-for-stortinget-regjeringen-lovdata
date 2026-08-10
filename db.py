@@ -169,7 +169,10 @@ def fts_sok(
     Postgres: GIN-index med norsk stemming via to_tsvector('norwegian', ...).
     SQLite: ILIKE-fallback (ingen norsk stemming finns).
 
-    Kommaseparerade termer tolkas som OR-logik.
+    Söktermerna följer projektets svarskontrakt: komma separerar termer och ger
+    OR mellan dem, medan flera ord inom en term ger AND — alla orden måste
+    förekomma. AND-delen faller ut av plainto_tsquery, som själv kombinerar
+    orden i en fras med &.
 
     Returnerar lista med dicts: {dok_id, kilde, dok_type, beteckning, tittel,
                                   dato, url, lovdata_id, rank}
@@ -502,3 +505,46 @@ def vektor_sok(
         }
         for r in rader
     ]
+
+
+def vektor_tackning() -> dict:
+    """
+    Redovisar hur många dokument och chunks per källa som har embeddings.
+
+    Används för att skilja ett äkta nollresultat i den semantiska sökningen
+    från att den valda källan aldrig har embeddats. Utan den skillnaden ser en
+    källa utan vektorer ut som en källa utan relevant innehåll, vilket leder
+    utredningsarbetet fel.
+
+    Returnerar {kilde: {dokument, dokument_med_vektor, chunks_med_vektor}}.
+    Tom dict om databasen inte är nåbar eller inte är PostgreSQL.
+    """
+    if not _ar_postgres():
+        return {}
+
+    sql = f"""
+        SELECT d.kilde,
+               COUNT(DISTINCT d.id)                                        AS dokument,
+               COUNT(DISTINCT c.dok_id) FILTER (WHERE c.embedding IS NOT NULL)
+                                                                           AS dok_med_vektor,
+               COUNT(c.id) FILTER (WHERE c.embedding IS NOT NULL)          AS chunks
+        FROM   {_prefix()}dokument d
+        LEFT JOIN {_prefix()}chunks c ON c.dok_id = d.id
+        GROUP  BY d.kilde
+    """
+    try:
+        with _cursor() as cur:
+            cur.execute(sql)
+            rader = cur.fetchall()
+    except Exception as exc:
+        log.warning("vektor_tackning misslyckades: %s", exc)
+        return {}
+
+    return {
+        r[0]: {
+            "dokument":            r[1],
+            "dokument_med_vektor": r[2],
+            "chunks_med_vektor":   r[3],
+        }
+        for r in rader
+    }

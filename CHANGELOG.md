@@ -6,7 +6,84 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ---
 
-## [1.1.0] — 2026-05-16
+## [1.1.0] — 2026-08-10
+
+### Tillagt
+
+- **`nor_lista_publikasjoner(sakid)`** — listar en saks publikationsreferenser utan
+  fulltext. Sökträffar saknar publikationer eftersom Stortingets listendpoint
+  (`/eksport/saker`) inte bär `publikasjon_referanse_liste` — bara den enskilda
+  saken (`/eksport/sak`) gör det. Verktyget är den billiga vägen från en sökträff
+  till sakens dokument.
+- **`bara_metadata`** och **`publikasjon`** i `nor_hamta_dokument` — hämta sakens
+  metadata utan fulltext, respektive en enskild publikation ur saken.
+- **`max_tecken`** och **`fran_tecken`** i `nor_hamta_dokument`, `nor_sok_i_dokument`,
+  `nor_hamta_lovdokument` och `nor_hamta_horinginnspill`. Trunkerade svar bär
+  `trunkerad`, `tecken_totalt`, `tecken_visade` och `fortsatt_fran_tecken`, och
+  kapas på ordgräns.
+- **`regjeringen_url`** som eget fält på saken. Proposisjoner och meldinger pekar
+  mot regjeringen.no, och URL:en låg tidigare bara inbäddad i
+  publikationsreferenserna trots att `nor_hamta_regjeringen`s dokumentation
+  hänvisade till ett fält med detta namn.
+- **`matchade_termer`** per sökträff — visar vilken term som gav träffen.
+- **`diagnostik`** i `nor_sok_semantisk` vid nollresultat, med ny hjälpfunktion
+  `vektor_tackning()` i `db.py`. Svaret skiljer nu "inget matchade frågan" från
+  "källan har inga embeddings".
+- **`BotskyddFel`** i `regjeringen.py` — regjeringen.no ligger sedan 2026-08 bakom en
+  Cloudflare JS-challenge som svarar HTTP 403 på hela domänen, oberoende av
+  User-Agent. Verktyget känner igen `cf-mitigated: challenge` och returnerar
+  `fel_typ: "kalla_blockerar_automatiserad_atkomst"` med de vägar som faktiskt
+  fungerar, i stället för ett rått 403.
+- **`StortingetFel`** i `stortinget.py` — Stortinget svarar HTTP 500 med ett
+  `<feil>`-dokument när en identifierare är okänd eller saknar innehåll. Det
+  översätts nu till ett begripligt besked i stället för ett rått serverfel.
+
+### Ändrat
+
+- **Söktermernas semantik.** Komma separerar termer (OR mellan dem); flera ord
+  inom en term matchas med AND. Tidigare splittrades frågan även på blanksteg,
+  vilket gjorde att en fras löstes upp i fristående ord med OR-logik.
+  **Sökresultaten för befintliga anrop förändras** — sökningar som tidigare gav
+  breda träfflistor ger nu färre och mer precisa träffar.
+- `nor_hamta_horinginnspill` har `med_fulltext=True` som standard. Fulltexten
+  ingår i samma svar från källan, så det kostar inget extra anrop.
+- `synk_daglig.sh` kör `nor_embedding.py --kilde alla` i stället för
+  `--kilde lovdata`. Stortinget- och regjeringen-dokument i cachen fick tidigare
+  aldrig några vektorer.
+
+### Fixat
+
+- **`nor_hamta_dokument` kunde inte begränsas och sprängde MCP:s storleksgräns.**
+  Verktyget returnerade sakens metadata plus fulltext för samtliga publikationer i
+  ett svar. För en sak med sju publikationer avbröts anropet med
+  "Tool result is too large" utan någon väg runt.
+- **`nor_hamta_horinginnspill` returnerade tomma fält.** Fältnamnen var antagna,
+  inte verifierade: koden läste `avsender`, `ingress` och `eksport_id`, medan
+  källan levererar `organisasjon`, `tittel`, `dato`, `id` och `tekst`.
+  Konsekvensen var att varje innspill fick tom avsändare och att `med_fulltext`
+  var verkningslös, eftersom den byggde på ett `eksport_id` som aldrig existerat.
+  Fulltexten fanns hela tiden i samma svar. Fältnamnen är nu verifierade mot ett
+  live-svar (2026-08-10); notera att API:ets dokumentationssida visar ett äldre
+  exempel med elementnamnen `horingsnotat_liste`/`horingsnotat`, vilket inte
+  stämmer med vad tjänsten returnerar.
+- **`nor_sok_i_dokument` hittade bara Lovdata-dokument.** SQL-frågan filtrerade på
+  `kilde = 'lovdata'` medan dokumentationen utlovade att Stortinget-beteckning och
+  titeldel fungerade. Sökningen går nu mot alla cachade källor, och felmeddelandet
+  skiljer okänd identifierare från dokument som finns men saknar extraherad text.
+- Tyst trunkering vid 600 tecken per träff i `nor_sok_i_dokument`.
+
+### Bakgrund
+
+Ändringarna genomför projektets svarskontrakt (`00-las-forst.md` → "Svarskontraktet
+— storlek, trunkering, adressering och sökning") i den här servern.
+
+**OBS vid uppgradering:** `nor_lista_publikasjoner` är ett nytt verktyg i en
+befintlig server. MCP-klienter som cachelägger verktygsindexet per servernamn kan
+behöva ett nytt servernamn i konfigurationen för att se det.
+
+---
+
+### Ur tidigare opublicerat arbete
 
 ### Tillagt
 

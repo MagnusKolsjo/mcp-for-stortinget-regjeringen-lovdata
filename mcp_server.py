@@ -8,6 +8,7 @@ Exponerar följande verktyg till MCP-kompatibla AI-verktyg:
 
   nor_lista_sesjoner      — Listar alla Stortingssesjoner (1986-87 och framåt)
   nor_sok_stortinget      — Söker saker, spørsmål och høringer i Stortinget
+  nor_lista_publikasjoner — Listar en saks publikationsreferenser utan fulltext
   nor_hamta_dokument      — Hämtar metadata + fulltext för ett Stortinget-dokument
   nor_hamta_regjeringen   — Hämtar en proposisjon/NOU/Meld.St. från regjeringen.no
   nor_sok_lovdata         — Söker norska lagar och föreskrifter (Lovdata-cache)
@@ -61,6 +62,12 @@ MCP_HOST      = os.getenv("MCP_HOST",      "127.0.0.1")
 MCP_PORT      = int(os.getenv("MCP_PORT",  "8003"))
 MCP_API_KEY   = os.getenv("MCP_API_KEY",   "")
 
+# Standardtak för fulltext i hämtverktygen. Utan ett tak som gäller by default
+# kan ett anrop mot ett stort dokument överskrida MCP-protokollets storleksgräns
+# och misslyckas helt, utan väg runt. Anroparen kan alltid höja taket, eller
+# sätta 0 för hela texten som ett uttryckligt val.
+NOR_MAX_TECKEN = int(os.getenv("NOR_MAX_TECKEN", "60000"))
+
 # ── Query-expansion ────────────────────────────────────────────────────────────
 # Aktiveras via QUERY_EXPANSION_ENABLED=true i .env.
 # Stöder alla OpenAI-kompatibla endpoints (Claude, OpenAI, Ollama, LM Studio).
@@ -93,7 +100,16 @@ mcp = FastMCP(
         "Täcker Stortinget (1986-87–idag), norska lagar och föreskrifter (Lovdata), "
         "samt proposisjoner och NOU från regjeringen.no. "
         "Verktygen har prefixet nor_. "
-        "Söktermen kan innehålla kommaseparerade ord — de tolkas som OR-logik. "
+        "SÖKTERMER: komma separerar termer och tolkas som OR mellan dem; flera "
+        "ord inom en och samma term tolkas som AND — alla orden måste förekomma. "
+        "'forbud mot konverteringsterapi, omvendelsesterapi' söker alltså efter "
+        "poster som innehåller alla tre orden i första termen, eller ordet i den "
+        "andra. Varje träff visar i matchade_termer vilken term som gav träffen. "
+        "SVARSSTORLEK: hämtverktygen tar max_tecken och fran_tecken; ett trunkerat "
+        "svar bär fälten trunkerad och fortsatt_fran_tecken. Börja med "
+        "nor_hamta_dokument(bara_metadata=True) för stora saker och hämta sedan en "
+        "publikation i taget — hela saken på en gång kan överskrida svarsgränsen. "
+        "nor_lista_publikasjoner ger vägen från en sökträff till sakens dokument. "
         "nor_hamta_vedtak ger parlamentariska beslutstexter. "
         "nor_hamta_horinginnspill ger skriftliga remissvar till høringer. "
         "nor_lista_emner ger Stortingets ämnesklassificering."
@@ -155,6 +171,51 @@ def expandera_fraga(fraga: str) -> list[str]:
         return []
 
 
+def _begransa_text(
+    text: Optional[str],
+    max_tecken: int,
+    fran_tecken: int = 0,
+) -> dict:
+    """
+    Skär ut ett textutdrag och redovisa alltid vad som kapats.
+
+    Returnerar ett dict-fragment som slås ihop med verktygets svar:
+      text                — utdraget
+      tecken_totalt       — hela textens längd
+      tecken_visade       — utdragets längd
+      trunkerad           — True om något kapats bort
+      fortsatt_fran_tecken — värde att skicka som fran_tecken i nästa anrop,
+                             eller None när texten är slut
+
+    max_tecken <= 0 betyder ingen trunkering. Klipper på ordgräns, aldrig
+    mitt i ett ord.
+    """
+    text = text or ""
+    totalt = len(text)
+    start  = max(0, min(fran_tecken, totalt))
+    rest   = text[start:]
+
+    if max_tecken and max_tecken > 0 and len(rest) > max_tecken:
+        utdrag    = rest[:max_tecken]
+        brytpunkt = max(utdrag.rfind(" "), utdrag.rfind("\n"))
+        if brytpunkt > max_tecken * 0.6:
+            utdrag = utdrag[:brytpunkt]
+        utdrag = utdrag.rstrip()
+        trunkerad = True
+    else:
+        utdrag    = rest
+        trunkerad = False
+
+    slut = start + len(utdrag)
+    return {
+        "text":                 utdrag,
+        "tecken_totalt":        totalt,
+        "tecken_visade":        len(utdrag),
+        "trunkerad":            trunkerad,
+        "fortsatt_fran_tecken": slut if slut < totalt else None,
+    }
+
+
 def _hamta_embedding_modell():
     """Laddar embeddingmodellen vid behov (lat laddning, FD1-skyddad)."""
     global _embedding_modell
@@ -208,8 +269,11 @@ def nor_sok_stortinget(
     Söker i Stortingets data för en given session.
 
     Parametrar:
-      fraga          — Sökfråga. Kommaseparerade termer = OR-logik.
-                       Exempel: "skatt, avgift" hittar om skatt ELLER avgift.
+      fraga          — Sökfråga. Komma separerar termer och ger OR mellan dem;
+                       flera ord inom en term ger AND — alla orden måste
+                       förekomma. "skatt, avgift" hittar skatt ELLER avgift;
+                       "forbud mot konverteringsterapi" kräver alla tre orden.
+                       Varje träff visar i matchade_termer vad som gav träffen.
                        Tom sträng med filter = hämta alla som matchar filtren.
       sesjonid       — Sessions-ID, t.ex. "2024-2025". Tomt = senaste session.
       typer          — Kommaseparerad lista: saker, sporsmal, horinger.
@@ -274,6 +338,10 @@ def nor_hamta_dokument(
     id_typ: str = "sakid",
     sesjonid: str = "",
     spara_i_db: bool = True,
+    bara_metadata: bool = False,
+    publikasjon: str = "",
+    max_tecken: int = NOR_MAX_TECKEN,
+    fran_tecken: int = 0,
 ) -> dict:
     """
     Hämtar metadata och fulltext för ett Stortinget-dokument.
@@ -286,15 +354,30 @@ def nor_hamta_dokument(
       sesjonid  — Sessions-ID för XML-parsning (t.ex. "2024-2025").
                   Lämna tomt om okänt — påverkar val av XML-parser.
       spara_i_db — Spara dokumentet i lokal databas (standard: true).
+      bara_metadata — Returnera sakens metadata och publikationsreferenserna
+                  UTAN fulltext. Snabbt och litet svar. Använd detta först för
+                  att se vilka publikationer saken har, och hämta sedan en i taget.
+      publikasjon — Hämta bara EN publikation ur saken. Ange dess eksport_id
+                  eller lenke_url ur publikasjon_referanse_liste. Tom = alla.
+      max_tecken — Teckentak per publikations fulltext (0 = ingen trunkering).
+                  Varje trunkerat dokument får fälten trunkerad, tecken_totalt,
+                  tecken_visade och fortsatt_fran_tecken.
+      fran_tecken — Börja fulltexten vid denna teckenposition (paginering).
 
     Returnerar:
-      metadata   — Sakens metadata (tittel, status, emner, publikasjoner)
+      sak        — Sakens metadata (tittel, status, emner, publikasjoner,
+                   regjeringen_url)
       dokument   — Lista av hämtade publikasjoner med fulltext_md
       fel        — Eventuellt felmeddelande
 
+    STORLEK: en sak kan ha många publikationer på vardera hundratusentals tecken.
+    Utan begränsning kan svaret överskrida MCP:s storleksgräns och anropet
+    misslyckas helt. Börja därför med bara_metadata=True, och hämta sedan
+    enskilda publikationer med publikasjon=... och vid behov max_tecken.
+
     OBS: Proposisjoner distribueras INTE av Stortingets API utan hämtas direkt
-    från regjeringen.no via nor_hamta_regjeringen. Använd den funktionen med
-    URL:en ur sak-objektets publikasjon_referanse_liste.
+    från regjeringen.no via nor_hamta_regjeringen. URL:en finns i sakens fält
+    regjeringen_url.
     """
     try:
         dokument_lista = []
@@ -305,7 +388,40 @@ def nor_hamta_dokument(
             if not sesjonid:
                 sesjonid = sak.get("sesjonid", "")
 
-            for pub_ref in sak.get("publikasjoner", []):
+            # Metadata utan fulltext — det billiga första anropet
+            if bara_metadata:
+                return {
+                    "sakid":            id,
+                    "sesjonid":         sesjonid,
+                    "sak":              sak,
+                    "publikasjoner":    sak.get("publikasjoner", []),
+                    "regjeringen_url":  sak.get("regjeringen_url", ""),
+                    "dokument":         [],
+                    "notat": (
+                        "Endast metadata hämtad. Hämta en publikation med "
+                        "nor_hamta_dokument(id=..., publikasjon=<eksport_id eller lenke_url>)."
+                    ),
+                }
+
+            pub_referenser = sak.get("publikasjoner", [])
+            if publikasjon:
+                valda = [
+                    p for p in pub_referenser
+                    if publikasjon in (p.get("eksport_id", ""), p.get("lenke_url", ""))
+                ]
+                if not valda:
+                    return {
+                        "fel": (
+                            f"Publikationen '{publikasjon}' finns inte bland sakens "
+                            f"{len(pub_referenser)} publikationsreferenser. Kör "
+                            f"nor_lista_publikasjoner('{id}') för att se giltiga värden."
+                        ),
+                        "sakid": id,
+                        "publikasjoner": pub_referenser,
+                    }
+                pub_referenser = valda
+
+            for pub_ref in pub_referenser:
                 pub_id  = pub_ref.get("eksport_id", "")
                 pub_url = pub_ref.get("lenke_url", "")
 
@@ -314,6 +430,11 @@ def nor_hamta_dokument(
                     if pub_url:
                         log.info("Hämtar regjeringen.no-dokument: %s", pub_url)
                         rg_data = rg.hamta_og_ekstraher(pub_url)
+                        # Trunkeringen gäller bara svaret till anroparen —
+                        # databasen får alltid hela texten.
+                        utdrag = _begransa_text(
+                            rg_data.get("fulltext_md"), max_tecken, fran_tecken
+                        )
                         dokument_lista.append({
                             "typ":         rg_data.get("dok_type", "ekstern"),
                             "kilde":       "regjeringen.no",
@@ -321,7 +442,11 @@ def nor_hamta_dokument(
                             "pdf_url":     rg_data.get("pdf_url"),
                             "tittel":      rg_data.get("tittel", ""),
                             "beteckning":  rg_data.get("beteckning", ""),
-                            "fulltext_md": rg_data.get("fulltext_md"),
+                            "fulltext_md": utdrag["text"],
+                            "tecken_totalt":        utdrag["tecken_totalt"],
+                            "tecken_visade":        utdrag["tecken_visade"],
+                            "trunkerad":            utdrag["trunkerad"],
+                            "fortsatt_fran_tecken": utdrag["fortsatt_fran_tecken"],
                             "fel":         rg_data.get("fel"),
                         })
                         if spara_i_db and rg_data.get("fulltext_md"):
@@ -353,12 +478,19 @@ def nor_hamta_dokument(
 
                 # Stortinget-dokument — hämta XML
                 parsed = st.hamta_og_parse_publikasjon(pub_id, sesjonid)
+                utdrag = _begransa_text(
+                    parsed["fulltext_md"], max_tecken, fran_tecken
+                )
                 dokument_lista.append({
                     "publikasjonid": pub_id,
                     "tittel":        parsed["tittel"],
                     "typ":           parsed["typ"],
                     "metadata":      parsed["metadata"],
-                    "fulltext_md":   parsed["fulltext_md"],
+                    "fulltext_md":   utdrag["text"],
+                    "tecken_totalt":        utdrag["tecken_totalt"],
+                    "tecken_visade":        utdrag["tecken_visade"],
+                    "trunkerad":            utdrag["trunkerad"],
+                    "fortsatt_fran_tecken": utdrag["fortsatt_fran_tecken"],
                 })
 
                 # Spara i databas
@@ -381,12 +513,20 @@ def nor_hamta_dokument(
                     except Exception as db_exc:
                         log.warning("Databasskrivning misslyckades: %s", db_exc)
 
-            return {
-                "sakid":    id,
-                "sesjonid": sesjonid,
-                "sak":      sak,
-                "dokument": dokument_lista,
+            svar = {
+                "sakid":           id,
+                "sesjonid":        sesjonid,
+                "sak":             sak,
+                "regjeringen_url": sak.get("regjeringen_url", ""),
+                "dokument":        dokument_lista,
             }
+            if any(d.get("trunkerad") for d in dokument_lista):
+                svar["notat"] = (
+                    "Minst ett dokument är trunkerat. Läs vidare med "
+                    "fran_tecken=<fortsatt_fran_tecken>, eller sätt max_tecken=0 "
+                    "för hela texten."
+                )
+            return svar
 
         elif id_typ == "publikasjonid":
             # Direkt publikasjonhämtning utan sak-kontext
@@ -410,10 +550,18 @@ def nor_hamta_dokument(
                 except Exception as db_exc:
                     log.warning("Databasskrivning misslyckades: %s", db_exc)
 
+            utdrag = _begransa_text(parsed["fulltext_md"], max_tecken, fran_tecken)
             return {
                 "publikasjonid": id,
                 "sesjonid":      sesjonid,
-                "dokument":      [parsed],
+                "dokument":      [{
+                    **parsed,
+                    "fulltext_md":          utdrag["text"],
+                    "tecken_totalt":        utdrag["tecken_totalt"],
+                    "tecken_visade":        utdrag["tecken_visade"],
+                    "trunkerad":            utdrag["trunkerad"],
+                    "fortsatt_fran_tecken": utdrag["fortsatt_fran_tecken"],
+                }],
             }
 
         else:
@@ -422,6 +570,55 @@ def nor_hamta_dokument(
     except Exception as exc:
         log.error("nor_hamta_dokument misslyckades (id=%s, typ=%s): %s", id, id_typ, exc)
         return {"fel": str(exc), "id": id, "id_typ": id_typ}
+
+
+@mcp.tool()
+def nor_lista_publikasjoner(sakid: str) -> dict:
+    """
+    Listar en saks publikationsreferenser — utan fulltext.
+
+    Detta är vägen från en sökträff till sakens dokument. Sökträffar från
+    nor_sok_stortinget och nor_sok kommer från Stortingets listendpoint, som
+    inte bär publikationsreferenserna; de finns bara på den enskilda saken.
+    Verktyget hämtar dem billigt, utan att dra in någon fulltext.
+
+    Parametrar:
+      sakid — Stortingets ärendenummer, t.ex. "94762"
+
+    Returnerar:
+      publikasjoner   — Lista med eksport_id, lenke_url, lenke_tekst och type
+      regjeringen_url — URL till proposisjonen/meldingen på regjeringen.no om
+                        saken har en sådan (indata till nor_hamta_regjeringen)
+      tittel, sesjonid, dokumentgruppe, sak_status
+
+    Kedjning:
+      eksport_id → nor_hamta_dokument(id=<eksport_id>, id_typ="publikasjonid")
+      regjeringen_url → nor_hamta_regjeringen(url=<regjeringen_url>)
+    """
+    try:
+        sak = st.hamta_sak(sakid)
+        pub = sak.get("publikasjoner", [])
+        svar = {
+            "sakid":           sakid,
+            "tittel":          sak.get("tittel", ""),
+            "sesjonid":        sak.get("sesjonid", ""),
+            "dokumentgruppe":  sak.get("dokumentgruppe", ""),
+            "sak_status":      sak.get("sak_status", ""),
+            "antal":           len(pub),
+            "publikasjoner":   pub,
+            "regjeringen_url": sak.get("regjeringen_url", ""),
+        }
+        if not pub:
+            svar["notat"] = (
+                "Saken har inga publikationsreferenser hos Stortinget. För "
+                "proposisjoner och meldinger ligger dokumentet på regjeringen.no; "
+                "saknas även regjeringen_url kan saken vara under behandling och "
+                "ännu inte ha publicerade dokument."
+            )
+        return svar
+    except Exception as exc:
+        log.error("nor_lista_publikasjoner misslyckades (sakid=%s): %s", sakid, exc)
+        return {"fel": str(exc), "sakid": sakid}
 
 
 @mcp.tool()
@@ -434,8 +631,9 @@ def nor_sok_lovdata(
     Söker i den lokala Lovdata-cachen (gällande norska lagar och forskrifter).
 
     Parametrar:
-      fraga     — Sökfråga. Kommaseparerade termer tolkas som OR-logik.
-                  Exempel: "arbeidsmiljø, oppsigelse" söker båda termerna.
+      fraga     — Sökfråga. Komma separerar termer och ger OR mellan dem;
+                  flera ord inom en term ger AND — alla orden måste förekomma.
+                  Exempel: "arbeidsmiljø, oppsigelse" söker endera termen.
       dok_type  — Filtrera på dokumenttyp: 'lov', 'forskrift' eller 'alla'.
                   Standard: alla.
       max_treff — Max antal träffar (standard 10).
@@ -484,21 +682,32 @@ def nor_sok_lovdata(
 
 
 @mcp.tool()
-def nor_hamta_lovdokument(lovdata_id: str, max_tecken: int = 0) -> dict:
+def nor_hamta_lovdokument(
+    lovdata_id: str,
+    max_tecken: int = NOR_MAX_TECKEN,
+    fran_tecken: int = 0,
+) -> dict:
     """
     Hämtar fulltext och metadata för ett Lovdata-dokument ur lokal cache.
 
     Parametrar:
-      lovdata_id — Lovdatas dokumentidentifierare, t.ex. 'NL/lov/2005-05-20-28'
-                   eller beteckning 'LOV-2005-05-20-28'.
-      max_tecken — Trunkera fulltext_md till detta antal tecken (0 = ingen trunkering).
-                   Rekommenderat för stora dokument (föreskrifter kan vara 100 000+
-                   tecken). Exempel: max_tecken=20000 för en inledande läsning.
+      lovdata_id  — Lovdatas dokumentidentifierare, t.ex. 'NL/lov/2005-05-20-28'
+                    eller beteckning 'LOV-2005-05-20-28'.
+      max_tecken  — Teckentak för fulltext_md (0 = ingen trunkering).
+                    Rekommenderat för stora dokument — föreskrifter kan vara
+                    100 000+ tecken. Exempel: max_tecken=20000 för en inledande
+                    läsning.
+      fran_tecken — Börja texten vid denna teckenposition. Skicka värdet ur
+                    fortsatt_fran_tecken för att läsa vidare där förra anropet
+                    slutade.
 
     Returnerar:
-      Metadata + fulltext_md för dokumentet.
+      Metadata + fulltext_md för dokumentet, samt tecken_totalt, tecken_visade,
+      trunkerad och fortsatt_fran_tecken.
       fulltext_md är null om dokumentet inte finns i cachen — synka först.
-      Om max_tecken är satt inkluderas fältet trunkerad=true om texten kapades.
+
+    Vill du hitta en enskild bestämmelse i stället för att läsa hela lagen —
+    använd nor_sok_i_dokument.
     """
     try:
         from db import _cursor, _ph, _prefix
@@ -524,11 +733,7 @@ def nor_hamta_lovdokument(lovdata_id: str, max_tecken: int = 0) -> dict:
                 "lovdata_id": lovdata_id,
             }
 
-        fulltext = rad[6]
-        trunkerad = False
-        if max_tecken and max_tecken > 0 and fulltext and len(fulltext) > max_tecken:
-            fulltext  = fulltext[:max_tecken]
-            trunkerad = True
+        utdrag = _begransa_text(rad[6], max_tecken, fran_tecken)
 
         return {
             "lovdata_id":  rad[0],
@@ -537,8 +742,11 @@ def nor_hamta_lovdokument(lovdata_id: str, max_tecken: int = 0) -> dict:
             "dok_type":    rad[3],
             "dato":        str(rad[4]) if rad[4] else None,
             "url":         rad[5],
-            "fulltext_md": fulltext,
-            "trunkerad":   trunkerad,
+            "fulltext_md":          utdrag["text"] if rad[6] else None,
+            "tecken_totalt":        utdrag["tecken_totalt"],
+            "tecken_visade":        utdrag["tecken_visade"],
+            "trunkerad":            utdrag["trunkerad"],
+            "fortsatt_fran_tecken": utdrag["fortsatt_fran_tecken"],
         }
 
     except Exception as exc:
@@ -557,8 +765,9 @@ def nor_sok(
     Lovdata (lokal cache) och regjeringen.no (lokal cache).
 
     Parametrar:
-      fraga     — Sökfråga på norska. Kommaseparerade termer = OR-logik.
-                  Exempel: "klimaendring, utslipp"
+      fraga     — Sökfråga på norska. Komma separerar termer och ger OR mellan
+                  dem; flera ord inom en term ger AND — alla orden måste
+                  förekomma. Exempel: "klimaendring, utslipp"
       sesjonid  — Begränsa Stortinget-sökning till en session (t.ex. "2024-2025").
                   Lämna tomt för senaste session.
       max_treff — Max antal träffar per källa (standard 10).
@@ -630,90 +839,141 @@ def nor_sok_i_dokument(
     lovdata_id: str,
     fraga: str,
     max_treff: int = 10,
+    max_tecken: int = 1500,
 ) -> dict:
     """
-    Söker inom ett specifikt cachat dokument och returnerar matchande paragrafer.
+    Söker inom ett specifikt cachat dokument och returnerar matchande avsnitt.
+
+    Söker i alla cachade källor — Lovdata, Stortinget och regjeringen.no.
 
     Parametrar:
-      lovdata_id — Dokumentets identifierare, t.ex. 'NL/lov/2005-05-20-28'
-                   eller beteckning 'LOV-2005-05-20-28'. Fungerar även med
-                   Stortinget-beteckning eller titeldel.
-      fraga      — Vad du söker efter. Söker i varje paragrafs text.
-      max_treff  — Max antal matchande paragrafer att returnera (standard 10).
+      lovdata_id — Dokumentets identifierare. Godtar Lovdata-id
+                   ('NL/lov/2005-05-20-28'), beteckning ('LOV-2005-05-20-28',
+                   'Prop. 132 L (2022-2023)'), publikasjonid eller en del av
+                   dokumentets titel.
+      fraga      — Vad du söker efter. Kommaseparerade termer = OR mellan dem;
+                   flera ord inom en term = AND (alla orden måste förekomma).
+      max_treff  — Max antal matchande avsnitt att returnera (standard 10).
+      max_tecken — Teckentak per träff (standard 1500, 0 = hela avsnittet).
 
     Returnerar:
-      Lista med matchande paragrafer ur fulltext_md, med §-nummer och text.
-      Nyttigt för att hitta specifika bestämmelser utan att läsa hela lagen.
+      Lista med matchande avsnitt ur fulltext_md, med rubrik och text.
+      Varje träff visar vilka termer som matchade och om texten är trunkerad.
+
+    OBS: söker bara i dokument som redan finns i den lokala cachen. Ett
+    Stortinget-dokument hamnar där när det hämtats med nor_hamta_dokument;
+    Lovdata-dokument kommer via den dagliga synken.
     """
     import re
 
     try:
         from db import _cursor, _ph, _prefix
 
+        # Slå upp brett — kilde-filtret som fanns här tidigare gjorde att
+        # verktyget bara hittade Lovdata-dokument, trots att dokumentationen
+        # utlovade Stortinget-beteckningar och titeldelar.
         with _cursor() as cur:
             cur.execute(
                 f"""
-                SELECT lovdata_id, beteckning, tittel, fulltext_md
+                SELECT lovdata_id, beteckning, tittel, fulltext_md, kilde,
+                       publikasjonid, url
                 FROM   {_prefix()}dokument
-                WHERE  kilde = {_ph()}
-                  AND  (lovdata_id = {_ph()} OR beteckning = {_ph()}
-                        OR tittel LIKE {_ph()})
+                WHERE  lovdata_id    = {_ph()}
+                   OR  beteckning    = {_ph()}
+                   OR  publikasjonid = {_ph()}
+                   OR  tittel     LIKE {_ph()}
+                ORDER BY (fulltext_md IS NOT NULL) DESC,
+                         length(coalesce(fulltext_md, '')) DESC
                 LIMIT 1
                 """,
-                ("lovdata", lovdata_id, lovdata_id, f"%{lovdata_id}%")
+                (lovdata_id, lovdata_id, lovdata_id, f"%{lovdata_id}%")
             )
             rad = cur.fetchone()
 
         if not rad:
             return {
-                "fel":        f"'{lovdata_id}' finns inte i cachen.",
-                "lovdata_id": lovdata_id,
-                "treff":      [],
+                "fel": (
+                    f"'{lovdata_id}' finns inte i den lokala cachen. Kontrollera "
+                    "identifieraren, eller hämta dokumentet först: Stortinget-"
+                    "dokument med nor_hamta_dokument, proposisjoner och NOU med "
+                    "nor_hamta_regjeringen. Lovdata-dokument kommer via den "
+                    "dagliga synken."
+                ),
+                "identifierare": lovdata_id,
+                "treff":         [],
             }
 
-        fulltext  = rad[3] if rad[3] else ""
-        dok_tittel = rad[2] or ""
-        dok_id     = rad[0] or ""
+        dok_id, beteckning, dok_tittel, fulltext, kilde, pub_id, url = rad
+        fulltext   = fulltext or ""
+        dok_tittel = dok_tittel or ""
 
         if not fulltext:
+            # Skilj "okänd identifierare" från "finns men saknar text" —
+            # felmeddelandet ska visa vägen framåt.
             return {
-                "lovdata_id": dok_id,
-                "tittel":     dok_tittel,
-                "fel":        "Dokumentet har ingen extraherad text i cachen.",
-                "treff":      [],
+                "identifierare": lovdata_id,
+                "lovdata_id":    dok_id,
+                "beteckning":    beteckning,
+                "tittel":        dok_tittel,
+                "kilde":         kilde,
+                "url":           url,
+                "fel": (
+                    "Dokumentet finns i cachen men har ingen extraherad fulltext. "
+                    "För regjeringen.no-dokument kan PDF-extraktionen ha "
+                    "misslyckats — kör nor_hamta_regjeringen(url=...) för att "
+                    "försöka igen."
+                ),
+                "treff": [],
             }
 
-        # Dela upp i paragrafer (avgränsas av ### i Markdown)
-        termer = [t.strip().lower() for t in fraga.split(",") if t.strip()]
+        # Dela upp i avsnitt (paragrafer avgränsas av ### i Markdown)
+        termer    = [t.strip().lower() for t in fraga.split(",") if t.strip()]
         sektioner = re.split(r"\n(?=###\s)", fulltext)
+
+        def _matchar(text_lower: str) -> list:
+            """OR mellan kommaseparerade termer, AND mellan ord inom en term."""
+            return [
+                t for t in termer
+                if all(o in text_lower for o in t.split() if o)
+            ]
 
         treff = []
         for seksjon in sektioner:
-            seksjon_lower = seksjon.lower()
-            if any(t in seksjon_lower for t in termer):
-                # Extrahera §-nummer ur rubriken
-                rubrik_m = re.match(r"###\s+(.+?)(?:\n|$)", seksjon)
-                rubrik   = rubrik_m.group(1).strip() if rubrik_m else ""
-                # Rensa Markdown-formatering för läsbarhet
-                ren_text = re.sub(r"\*[^*]+\*", "", seksjon).strip()
-                treff.append({
-                    "rubrik": rubrik,
-                    "text":   ren_text[:600],   # Begränsa per träff
-                })
-                if len(treff) >= max_treff:
-                    break
+            matchade = _matchar(seksjon.lower())
+            if not matchade:
+                continue
+            rubrik_m = re.match(r"###\s+(.+?)(?:\n|$)", seksjon)
+            rubrik   = rubrik_m.group(1).strip() if rubrik_m else ""
+            ren_text = re.sub(r"\*[^*]+\*", "", seksjon).strip()
+            utdrag   = _begransa_text(ren_text, max_tecken)
+            treff.append({
+                "rubrik":               rubrik,
+                "text":                 utdrag["text"],
+                "matchade_termer":      matchade,
+                "tecken_totalt":        utdrag["tecken_totalt"],
+                "trunkerad":            utdrag["trunkerad"],
+                "fortsatt_fran_tecken": utdrag["fortsatt_fran_tecken"],
+            })
+            if len(treff) >= max_treff:
+                break
 
         return {
-            "lovdata_id": dok_id,
-            "tittel":     dok_tittel,
-            "fraga":      fraga,
-            "antal":      len(treff),
-            "treff":      treff,
+            "identifierare": lovdata_id,
+            "lovdata_id":    dok_id,
+            "beteckning":    beteckning,
+            "tittel":        dok_tittel,
+            "kilde":         kilde,
+            "publikasjonid": pub_id,
+            "url":           url,
+            "fraga":         fraga,
+            "antal":         len(treff),
+            "avsnitt_totalt": len(sektioner),
+            "treff":         treff,
         }
 
     except Exception as exc:
         log.error("nor_sok_i_dokument misslyckades (id=%s): %s", lovdata_id, exc)
-        return {"fel": str(exc), "lovdata_id": lovdata_id, "treff": []}
+        return {"fel": str(exc), "identifierare": lovdata_id, "treff": []}
 
 
 def _hamta_regjeringen_fra_db(url: str) -> Optional[dict]:
@@ -919,7 +1179,8 @@ def nor_hamta_vedtak(
 @mcp.tool()
 def nor_hamta_horinginnspill(
     horingid: str,
-    med_fulltext: bool = False,
+    med_fulltext: bool = True,
+    max_tecken: int = 4000,
 ) -> dict:
     """
     Hämtar skriftliga innspill (remissvar) till en høring (utskottsutfrågning).
@@ -929,32 +1190,44 @@ def nor_hamta_horinginnspill(
     Parametrar:
       horingid     — Høringens ID-nummer (hämtas via nor_sok_stortinget med
                      typer='horinger').
-      med_fulltext — Om True hämtas fulltext för varje innspill som har
-                     eksport_id (kan ta tid). Standard: False.
+      med_fulltext — Ta med varje innspills text (standard: True). Sätt False
+                     för att bara få avsändare och rubriker — ett litet svar
+                     när du bara vill se vilka som yttrat sig.
+      max_tecken   — Teckentak per innspill (standard 4000, 0 = hela texten).
+                     En høring kan ha tjugo innspill på flera tusen tecken var.
 
     Returnerar:
-      Lista med innspill: id, tittel, avsender, dato, ingress.
-      Med med_fulltext=True: fulltext_md per innspill.
+      Lista med innspill: id, tittel, avsender, dato och (med med_fulltext)
+      fulltext_md samt trunkeringsfälten.
+
+    Fulltexten ingår i samma svar från Stortinget — inget extra anrop per
+    innspill behövs, och därför kostar med_fulltext=True ingen extra tid.
     """
     try:
         innspill = st.hamta_skriftlige_innspill(horingid)
 
-        if med_fulltext:
-            for item in innspill:
-                eksport_id = item.get("eksport_id", "")
-                if eksport_id:
-                    try:
-                        parsed = st.hamta_og_parse_publikasjon(eksport_id)
-                        item["fulltext_md"] = parsed.get("fulltext_md", "")
-                    except Exception as exc:
-                        log.warning("Fulltext för innspill %s misslyckades: %s", eksport_id, exc)
-                        item["fulltext_md"] = ""
+        for item in innspill:
+            hel_text = item.pop("fulltext_md", "") or ""
+            if med_fulltext:
+                utdrag = _begransa_text(hel_text, max_tecken)
+                item["fulltext_md"]          = utdrag["text"]
+                item["tecken_totalt"]        = utdrag["tecken_totalt"]
+                item["trunkerad"]            = utdrag["trunkerad"]
+                item["fortsatt_fran_tecken"] = utdrag["fortsatt_fran_tecken"]
+            else:
+                item["tecken_totalt"] = len(hel_text)
 
-        return {
+        svar = {
             "horingid": horingid,
             "antal":    len(innspill),
             "innspill": innspill,
         }
+        if not innspill:
+            svar["notat"] = (
+                "Høringen har inga godkända skriftliga innspill registrerade "
+                "hos Stortinget."
+            )
+        return svar
 
     except Exception as exc:
         log.error("nor_hamta_horinginnspill misslyckades (horingid=%s): %s", horingid, exc)
@@ -1051,12 +1324,49 @@ def nor_sok_semantisk(
         kilde_filter = None if kilde == "alla" else kilde
         treff = vektor_sok(embedding, kilde_filter=kilde_filter, max_treff=max_treff)
 
-        return {
+        svar = {
             "fraga":     fraga,
             "expansion": extra,
+            "kilde":     kilde,
             "antal":     len(treff),
             "treff":     treff,
         }
+
+        # Ett nollresultat kan betyda två helt olika saker: att inget matchar,
+        # eller att den valda källan aldrig embeddats. Utan den skillnaden
+        # framstår en oindexerad källa som en tom källa.
+        if not treff:
+            from db import vektor_tackning
+            tackning = vektor_tackning()
+            svar["diagnostik"] = {"vektor_tackning_per_kalla": tackning}
+
+            if kilde != "alla":
+                kalla_stat = tackning.get(kilde)
+                if kalla_stat is None:
+                    svar["diagnostik"]["orsak"] = (
+                        f"Källan '{kilde}' har inga dokument alls i den lokala cachen."
+                    )
+                elif not kalla_stat["chunks_med_vektor"]:
+                    svar["diagnostik"]["orsak"] = (
+                        f"Källan '{kilde}' har {kalla_stat['dokument']} dokument i "
+                        f"cachen men inga embeddings — semantisk sökning kan därför "
+                        f"aldrig ge träffar här. Kör nor_embedding.py --kilde "
+                        f"{kilde}. Använd nor_sok eller nor_sok_lovdata under tiden "
+                        f"(fulltextsökning kräver inga vektorer)."
+                    )
+                else:
+                    svar["diagnostik"]["orsak"] = (
+                        f"Källan '{kilde}' har {kalla_stat['chunks_med_vektor']} "
+                        f"embeddade textstycken — nollresultatet beror på att inget "
+                        f"matchade frågan, inte på att index saknas."
+                    )
+            elif not any(v["chunks_med_vektor"] for v in tackning.values()):
+                svar["diagnostik"]["orsak"] = (
+                    "Inga embeddings finns i databasen. Kör nor_embedding.py "
+                    "--kilde alla."
+                )
+
+        return svar
 
     except Exception as exc:
         log.error("nor_sok_semantisk misslyckades: %s", exc)

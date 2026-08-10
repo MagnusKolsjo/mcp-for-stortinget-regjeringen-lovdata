@@ -72,13 +72,39 @@ def _throttle():
         _bucket_tokens -= 1.0
 
 
+class StortingetFel(Exception):
+    """
+    Stortinget avvisade förfrågan med sitt eget <feil>-dokument.
+
+    API:et svarar med HTTP 500 och en <feil>-kropp när en identifierare är
+    okänd eller saknar innehåll — det är alltså inte ett serverhaveri utan ett
+    normalt "finns inte"-svar. Undantaget skiljer det fallet från äkta
+    nätverks- och serverfel så att verktygen kan ge ett begripligt besked.
+    """
+
+
 def _get_xml_root(path: str, params: Optional[dict] = None) -> etree._Element:
     """GET mot API_BASE/{path} — returnerar lxml-rot."""
     _throttle()
     url = f"{API_BASE}/{path}"
     r = httpx.get(url, params=params or {}, timeout=60)
-    r.raise_for_status()
+
     parser = etree.XMLParser(recover=True, load_dtd=False, no_network=True)
+
+    if r.status_code >= 400:
+        # Läs kroppen innan felet kastas — <feil> betyder "okänd identifierare",
+        # inte att tjänsten är trasig.
+        try:
+            rot = etree.fromstring(r.content, parser=parser)
+        except Exception:
+            rot = None
+        if rot is not None and _lokal_tag(rot) == "feil":
+            raise StortingetFel(
+                f"Stortinget känner inte igen förfrågan {path} med {params}. "
+                f"Kontrollera identifieraren."
+            )
+        r.raise_for_status()
+
     return etree.fromstring(r.content, parser=parser)
 
 
@@ -253,6 +279,16 @@ def _normalisera_sak(sak: etree._Element, fallback_id: str = "") -> dict:
                 "type":        pub_type,
             })
 
+    # Proposisjoner och stortingsmeldinger distribueras inte av Stortingets API
+    # utan pekar mot regjeringen.no. URL:en ligger i publikasjonsreferenserna;
+    # den lyfts fram som eget fält eftersom det är ingången till
+    # nor_hamta_regjeringen.
+    regjeringen_url = next(
+        (p["lenke_url"] for p in pub_refs
+         if p.get("lenke_url") and "regjeringen.no" in p["lenke_url"]),
+        "",
+    )
+
     return {
         "sakid":             sakid,
         "tittel":            tittel,
@@ -264,6 +300,7 @@ def _normalisera_sak(sak: etree._Element, fallback_id: str = "") -> dict:
         "stikkord":          stikkord,
         "emner":             emner,
         "publikasjoner":     pub_refs,
+        "regjeringen_url":   regjeringen_url,
     }
 
 
@@ -319,8 +356,11 @@ def sok_saker(
                 + " " + " ".join(s.get("stikkord", []))
                 + " " + (s.get("innstillingstekst") or "")
             )
-            if not _matcher(termer, sok_tekst):
+            traffade = _matchade_termer(termer, sok_tekst)
+            if not traffade:
                 continue
+            # Redovisa matchningsgrunden så anroparen ser VARFÖR träffen kom med
+            s = {**s, "matchade_termer": traffade}
 
         resultat.append(s)
 
@@ -378,7 +418,12 @@ def sok_sporsmal(fraga: str, sesjonid: str) -> list[dict]:
     termer = _split_termer(fraga)
     if not termer:
         return alle
-    return [s for s in alle if _matcher(termer, s["tittel"] or "")]
+    traffar = []
+    for s in alle:
+        matchade = _matchade_termer(termer, s["tittel"] or "")
+        if matchade:
+            traffar.append({**s, "matchade_termer": matchade})
+    return traffar
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +468,15 @@ def sok_horinger(fraga: str, sesjonid: str) -> list[dict]:
     termer = _split_termer(fraga)
     if not termer:
         return alle
-    return [h for h in alle if _matcher(termer, (h["tittel"] or "") + " " + (h["komite"] or ""))]
+
+    traffar = []
+    for h in alle:
+        matchade = _matchade_termer(
+            termer, (h["tittel"] or "") + " " + (h["komite"] or "")
+        )
+        if matchade:
+            traffar.append({**h, "matchade_termer": matchade})
+    return traffar
 
 
 # ---------------------------------------------------------------------------
@@ -431,14 +484,45 @@ def sok_horinger(fraga: str, sesjonid: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _split_termer(fraga: str) -> list[str]:
-    """Splittar frågan på komman och mellanslag → lista av lowercase-termer."""
-    return [t.strip().lower() for t in re.split(r"[,\s]+", fraga) if t.strip()]
+    """
+    Splittar frågan på komma → lista av lowercase-termer.
+
+    En term kan innehålla flera ord. Mellanslag inom en term splittar INTE —
+    orden hör ihop och matchas med AND (se _matcher). Den tidigare
+    uppsplittringen på mellanslag gjorde att en fras som
+    "forbud mot konverteringsterapi" löstes upp i tre fristående ord med
+    OR-logik, vilket rankade in varje ärende som råkade innehålla ordet "mot".
+    """
+    return [t.strip().lower() for t in fraga.split(",") if t.strip()]
+
+
+def _matcha_term(term: str, haystack_lower: str) -> bool:
+    """
+    Returnerar True om termen matchar. Alla ord i termen måste förekomma (AND).
+
+    Orden behöver inte stå intill varandra — titeln och ämnesorden är
+    hopslagna till en söksträng, så en flerordig term kan ha sina ord
+    utspridda över fälten.
+    """
+    ord_i_term = [o for o in term.split() if o]
+    if not ord_i_term:
+        return False
+    return all(o in haystack_lower for o in ord_i_term)
+
+
+def _matchade_termer(termer: list[str], haystack: str) -> list[str]:
+    """Returnerar de termer som matchar haystack (OR mellan termer, AND inom)."""
+    h = haystack.lower()
+    return [t for t in termer if _matcha_term(t, h)]
 
 
 def _matcher(termer: list[str], haystack: str) -> bool:
-    """Returnerar True om NÅGON term finns i haystack (OR-logik)."""
-    h = haystack.lower()
-    return any(t in h for t in termer)
+    """
+    Returnerar True om NÅGON term matchar (OR mellan kommaseparerade termer).
+
+    Inom en term gäller AND — alla ord måste förekomma.
+    """
+    return bool(_matchade_termer(termer, haystack))
 
 
 # ---------------------------------------------------------------------------
@@ -859,33 +943,79 @@ def hamta_vedtak_fulltext(vedtakid: str) -> dict:
 # Skriftlige innspill til høringer
 # ---------------------------------------------------------------------------
 
+def _html_till_text(html: str) -> str:
+    """
+    Gör om HTML-innehåll till läsbar text med bevarade styckegränser.
+
+    Høringsinnspillens tekst levereras som HTML i XML-elementet. Styckena är
+    betydelsebärande i remissvar, så <p> och <br> blir radbrytningar i stället
+    för att kollapsa till en enda textmassa.
+    """
+    if not html:
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+    except Exception as exc:
+        log.debug("HTML-parsning misslyckades, faller tillbaka på regex: %s", exc)
+        text = re.sub(r"<\s*(br|/p|/div|/li)\s*/?\s*>", "\n", html, flags=re.I)
+        text = re.sub(r"<[^>]+>", "", text)
+    # Normalisera whitespace utan att slå ihop stycken
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def hamta_skriftlige_innspill(horingid: str) -> list[dict]:
     """
     Hämtar lista med skriftliga innspill (remissvar) till en høring.
 
-    Returnerar lista med dicts: id, tittel, avsender, dato, ingress, eksport_id.
-    För fulltext, hämta via hamta_og_parse_publikasjon(eksport_id) om eksport_id finns.
+    Returnerar lista med dicts: id, tittel, avsender, dato, fulltext_md.
+
+    Fulltexten ingår i samma svar från källan — inget separat anrop behövs.
+
+    Fältnamnen är verifierade mot ett live-svar från
+    /eksport/horingsinnspill?horingid=... (2026-08-10). Källans element per
+    innspill är: dato, id, organisasjon, tekst, tittel. Notera att API:ets
+    dokumentationssida visar ett äldre exempelsvar med elementnamnen
+    horingsnotat_liste/horingsnotat — det stämmer inte med vad tjänsten
+    faktiskt returnerar. Rotelement och lista heter horingsinnspill_oversikt
+    respektive horingsinnspill_liste.
     """
-    root    = _get_xml_root("horingsinnspill", {"horingid": horingid})
+    # Källan svarar HTTP 500 med ett <feil>-dokument när høringen saknar
+    # godkända innspill eller ID:t är okänt. Översätt det till ett begripligt
+    # besked i stället för ett rått serverfel.
+    try:
+        root = _get_xml_root("horingsinnspill", {"horingid": horingid})
+    except StortingetFel:
+        raise StortingetFel(
+            f"Stortinget har inga godkända skriftliga innspill registrerade för "
+            f"høring {horingid}, alternativt är høring-ID:t okänt. Kontrollera "
+            f"ID:t mot nor_sok_stortinget(typer='horinger'). Observera att "
+            f"muntliga høringer normalt saknar skriftliga innspill."
+        ) from None
+
     i_liste = root.find(f"{NP}horingsinnspill_liste")
     if i_liste is None:
-        log.warning("Ingen horingsinnspill_liste i svar från /horingsinnspill?horingid=%s", horingid)
+        log.warning(
+            "Ingen horingsinnspill_liste i svar från /horingsinnspill?horingid=%s "
+            "(rotelement: %s)", horingid, _lokal_tag(root)
+        )
         return []
 
     result = []
     for item in i_liste:
-        dato_raa = _xt(item, "dato") or _xt(item, "fremsatt_dato")
+        dato_raa = _xt(item, "dato")
+        tekst_html = _xt(item, "tekst")
         result.append({
-            "id":         _xt(item, "id"),
-            "tittel":     _xt(item, "tittel"),
-            "avsender":   (
-                _xt(item, "avsender")
-                or _xt(item, "organisasjonsnavn")
-                or _xt(item, "navn")
-            ),
-            "dato":       dato_raa[:10] if dato_raa and dato_raa != "0001-01-01T00:00:00Z" else "",
-            "ingress":    _xt(item, "ingress"),
-            "eksport_id": _xt(item, "eksport_id"),
+            "id":          _xt(item, "id"),
+            "tittel":      _xt(item, "tittel"),
+            "avsender":    _xt(item, "organisasjon"),
+            "dato":        dato_raa[:10] if dato_raa and not dato_raa.startswith("0001-01-01") else "",
+            "fulltext_md": _html_till_text(tekst_html),
         })
     return result
 
