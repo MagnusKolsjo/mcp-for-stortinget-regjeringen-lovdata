@@ -86,8 +86,8 @@ Lägg till följande i Claude Desktops MCP-konfiguration (`claude_desktop_config
 {
   "mcpServers": {
     "norge": {
-      "command": "/sökväg/till/.venv/bin/python3",
-      "args": ["/sökväg/till/stream-13-norge/mcp_server.py"],
+      "command": "/<SOKVAG_TILL_VENV>/bin/python3",
+      "args": ["/<SOKVAG_TILL_REPO>/mcp_server.py"],
       "env": {}
     }
   }

@@ -59,7 +59,7 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
   HTTP-datum) respekteras och anropet görs om högst tre gånger.
 - Stortinget-anropen bär projektets User-Agent.
 
-### Fixat
+### Rättat
 
 - **`nor_hamta_vedtak(vedtakid=...)` var en dold bulkhämtning.** Stortinget
   har ingen endpoint för ett enskilt vedtak och ignorerar `vedtakid`, så
