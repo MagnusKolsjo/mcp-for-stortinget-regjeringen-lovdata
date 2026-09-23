@@ -969,15 +969,45 @@ def hamta_og_parse_publikasjon(eksport_id: str, sesjonid: str = "") -> dict:
 # Vedtak — parlamentariska beslut
 # ---------------------------------------------------------------------------
 
+# Källans enda vedtak-endpoint är /stortingsvedtak?sesjonid=X. Den returnerar
+# samtliga vedtak i sessionen med beslutstext, flera MB för en hel session.
+# Någon endpoint för ett enskilt vedtak finns inte: en vedtakid-parameter
+# ignoreras tyst och ger innevarande sessions hela lista. Ett enskilt vedtak
+# slås därför upp lokalt i sessionens lista, som hålls i minnet en stund så att
+# upprepade uppslag i samma session inte hämtar om flera MB varje gång.
+_VEDTAK_CACHE_TTL_S = 900
+_VEDTAK_CACHE_MAX   = 4
+_vedtak_cache: dict[str, tuple[float, list[dict]]] = {}
+_vedtak_cache_las = threading.Lock()
+
+
+def _https(url: str) -> str:
+    """Stortinget anger länkar protokollrelativt (//www.stortinget.no/...)."""
+    return f"https:{url}" if url.startswith("//") else url
+
+
 def hamta_vedtak_liste(sesjonid: str) -> list[dict]:
     """
-    Hämtar lista med stortingsvedtak för en session.
+    Hämtar samtliga stortingsvedtak för en session.
 
-    Returnerar lista med dicts: id, nummer, sak_id, sesjonid, dato, tittel, vedtakstekst.
-    vedtakstekst är beslutstexten (kan vara HTML-formaterad).
-    För fulltext, använd hamta_vedtak_fulltext(vedtakid).
+    Returnerar lista med dicts: id, nummer, sak_id, sesjonid, dato, tittel,
+    vedtakstype, vedtakstype_navn, url, sak_url och vedtakstekst (beslutstexten
+    som ren text; källan levererar den som HTML).
+
+    Fältnamnen följer källans dokumentation
+    (data.stortinget.no/dokumentasjon-og-hjelp/vedtak/): stortingsvedtak_nummer,
+    stortingsvedtak_dato_tid, stortingsvedtak_tekst, stortingsvedtak_tittel,
+    stortingsvedtak_type, stortingsvedtak_lenke_url. Sessions-ID står en gång
+    i rotelementet, inte per vedtak.
     """
+    nu = time.monotonic()
+    with _vedtak_cache_las:
+        traff = _vedtak_cache.get(sesjonid)
+        if traff and nu - traff[0] < _VEDTAK_CACHE_TTL_S:
+            return [dict(v) for v in traff[1]]
+
     root    = _get_xml_root("stortingsvedtak", {"sesjonid": sesjonid})
+    rot_sesjon = _xt(root, "sesjon_id") or sesjonid
     v_liste = root.find(f"{NP}stortingsvedtak_liste")
     if v_liste is None:
         log.warning("Ingen stortingsvedtak_liste i svar från /stortingsvedtak?sesjonid=%s", sesjonid)
@@ -985,59 +1015,42 @@ def hamta_vedtak_liste(sesjonid: str) -> list[dict]:
 
     result = []
     for v in v_liste.findall(f"{NP}stortingsvedtak"):
-        dato_raa = _xt(v, "dato_tid")
+        dato_raa = _xt(v, "stortingsvedtak_dato_tid")
+        typ_el   = v.find(f"{NP}stortingsvedtak_type")
         result.append({
-            "id":           _xt(v, "id"),
-            "nummer":       _xt(v, "nummer"),
-            "sak_id":       _xt(v, "sak_id"),
-            "sesjonid":     _xt(v, "sesjon_id") or sesjonid,
-            "dato":         dato_raa[:10] if dato_raa and dato_raa != "0001-01-01T00:00:00Z" else "",
-            "tittel":       _xt(v, "stortingsvedtak_tittel"),
-            "vedtakstekst": _xt(v, "tekst"),
+            "id":               _xt(v, "id"),
+            "nummer":           _xt(v, "stortingsvedtak_nummer"),
+            "sak_id":           _xt(v, "sak_id"),
+            "sesjonid":         rot_sesjon,
+            "dato":             dato_raa[:10] if dato_raa and not dato_raa.startswith("0001-01-01") else "",
+            "tittel":           _xt(v, "stortingsvedtak_tittel"),
+            "vedtakstype":      _xt(typ_el, "id") if typ_el is not None else "",
+            "vedtakstype_navn": _xt(typ_el, "navn") if typ_el is not None else "",
+            "url":              _https(_xt(v, "stortingsvedtak_lenke_url")),
+            "sak_url":          _https(_xt(v, "sak_lenke_url")),
+            "vedtakstekst":     _html_till_text(_xt(v, "stortingsvedtak_tekst")),
         })
-    return result
+
+    with _vedtak_cache_las:
+        _vedtak_cache[sesjonid] = (time.monotonic(), result)
+        while len(_vedtak_cache) > _VEDTAK_CACHE_MAX:
+            aldst = min(_vedtak_cache, key=lambda k: _vedtak_cache[k][0])
+            del _vedtak_cache[aldst]
+    return [dict(v) for v in result]
 
 
-def hamta_vedtak_fulltext(vedtakid: str) -> dict:
+def hamta_vedtak(vedtakid: str, sesjonid: str) -> Optional[dict]:
     """
-    Hämtar fulltext för ett enstaka stortingsvedtak.
+    Slår upp ett enskilt stortingsvedtak i en sessions vedtakslista.
 
-    Returnerar dict med: id, tittel, fulltext_md, url.
-    fulltext_md är extraherad beslutstext (kan vara HTML med beslutsspråk).
+    Källan saknar uppslag på vedtakid (se kommentaren ovan), så vedtaket
+    söks bara i den angivna sessionen. Returnerar None om det inte finns där.
     """
-    r = _get("stortingsvedtak", {"vedtakid": vedtakid})
-    r.raise_for_status()
-
-    content_type = r.headers.get("content-type", "").lower()
-
-    if "xml" in content_type:
-        parser = etree.XMLParser(recover=True, load_dtd=False, no_network=True)
-        root = etree.fromstring(r.content, parser=parser)
-        vedtak_el = root.find(f"{NP}stortingsvedtak") or root
-        vedtakstekst = _xt(vedtak_el, "tekst") or _all_text(vedtak_el)
-        tittel       = _xt(vedtak_el, "stortingsvedtak_tittel")
-        fulltext_md  = vedtakstekst
-    else:
-        # HTML-format (alternativt returformat)
-        try:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(r.text, "html.parser")
-            # Ta bort skript och stilar
-            for tag in soup(["script", "style", "nav", "header", "footer"]):
-                tag.decompose()
-            tittel      = (soup.find("h1") or soup.find("title") or soup.find("h2"))
-            tittel      = tittel.get_text(strip=True) if tittel else ""
-            fulltext_md = soup.get_text(separator="\n", strip=True)
-        except Exception as exc:
-            log.warning("HTML-parsning av vedtak misslyckades: %s", exc)
-            tittel, fulltext_md = "", r.text[:5000]
-
-    return {
-        "id":          vedtakid,
-        "tittel":      tittel,
-        "fulltext_md": fulltext_md,
-        "url":         f"{API_BASE}/vedtak?vedtakid={vedtakid}",
-    }
+    vedtakid = vedtakid.strip()
+    return next(
+        (v for v in hamta_vedtak_liste(sesjonid) if v["id"] == vedtakid),
+        None,
+    )
 
 
 # ---------------------------------------------------------------------------

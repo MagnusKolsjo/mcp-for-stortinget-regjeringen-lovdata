@@ -1110,6 +1110,9 @@ def nor_hamta_regjeringen(url: str, spara_i_db: bool = True) -> dict:
         }
 
 
+_VEDTAK_LISTFALT = ("id", "nummer", "sak_id", "dato", "tittel", "vedtakstype")
+
+
 @mcp.tool()
 def nor_hamta_vedtak(
     sesjonid: str = "",
@@ -1119,57 +1122,86 @@ def nor_hamta_vedtak(
     """
     Hämtar stortingsvedtak (parlamentariska beslut).
 
-    Kan antingen lista alla vedtak för en session, eller hämta ett
-    specifikt vedtak med fulltext.
+    Listar alla vedtak i en session, eller hämtar ett enskilt vedtak med
+    beslutstext.
 
     Parametrar:
-      sesjonid     — Sessions-ID (t.ex. "2024-2025"). Lämna tomt för
-                     senaste session. Används för listning.
-      vedtakid     — ID för ett specifikt vedtak. Om angivet hämtas
-                     fulltext för just detta vedtak.
-      med_fulltext — Om True och sesjonid är angivet (ej vedtakid):
-                     hämta fulltext för alla vedtak i sessionen.
-                     Kan ta tid! Standard: False.
+      sesjonid     — Sessions-ID (t.ex. "2024-2025"). Tomt = innevarande
+                     session. Gäller både listning och uppslag av vedtakid.
+      vedtakid     — ID för ett enskilt vedtak (t.ex. "40030102"). Vedtaket
+                     slås upp i sessionen ovan; Stortinget har inget uppslag
+                     direkt på vedtakid. Ligger vedtaket i en annan session
+                     än den innevarande måste sesjonid anges.
+      med_fulltext — Vid listning: ta med varje vedtaks beslutstext. Texterna
+                     följer med i samma svar från källan, så det kostar inga
+                     extra anrop, men en hel session kan ha tusen vedtak och
+                     flera hundra tusen tecken text. Svaret tar därför med text
+                     upp till ett samlat teckentak; vedtak därefter får
+                     fulltext_utelamnad=True och hämtas enskilt med vedtakid.
+                     Standard: False.
 
     Returnerar:
-      vedtak_liste — Lista med vedtak (id, sak_id, dato, tittel, vedtakstekst)
-      eller
-      vedtak       — Fulltext för ett specifikt vedtak (id, tittel, fulltext_md)
+      vid listning: sesjonid, antal och vedtak_liste (id, nummer, sak_id,
+                    dato, tittel, vedtakstype och vid med_fulltext
+                    fulltext_md)
+      vid vedtakid: vedtakid, sesjonid och vedtak (samma fält plus
+                    vedtakstype_navn, url, sak_url och fulltext_md med hela
+                    beslutstexten)
     """
     try:
-        sesjoner = _sesjoner()
-        if not sesjonid and not vedtakid:
-            sesjonid = st.aktuell_sesjonid(sesjoner)
-
-        # Specifikt vedtak med fulltext
-        if vedtakid:
-            fulltext = st.hamta_vedtak_fulltext(vedtakid)
-            return {
-                "vedtakid": vedtakid,
-                "vedtak":   fulltext,
-            }
-
-        # Lista för en session
         if not sesjonid:
-            sesjonid = st.aktuell_sesjonid(sesjoner)
+            sesjonid = st.aktuell_sesjonid(_sesjoner())
 
-        vedtak_liste = st.hamta_vedtak_liste(sesjonid)
+        if vedtakid:
+            vedtak = st.hamta_vedtak(vedtakid, sesjonid)
+            if vedtak is None:
+                return {
+                    "fel": (
+                        f"Vedtak {vedtakid} finns inte bland vedtaken i session "
+                        f"{sesjonid}. Stortinget har inget uppslag direkt på "
+                        f"vedtakid, så vedtaket söks bara i en session åt gången. "
+                        f"Ange sesjonid för den session vedtaket fattades i."
+                    ),
+                    "vedtakid": vedtakid,
+                    "sesjonid": sesjonid,
+                }
+            vedtak["fulltext_md"] = vedtak.pop("vedtakstekst", "")
+            return {"vedtakid": vedtakid, "sesjonid": sesjonid, "vedtak": vedtak}
 
-        if med_fulltext:
-            for v in vedtak_liste:
-                if v.get("id"):
-                    try:
-                        ft = st.hamta_vedtak_fulltext(v["id"])
-                        v["fulltext_md"] = ft.get("fulltext_md", "")
-                    except Exception as exc:
-                        log.warning("Fulltext för vedtak %s misslyckades: %s", v["id"], exc)
-                        v["fulltext_md"] = ""
+        # En session kan ha över tusen vedtak. Listan bär därför bara de fält
+        # som behövs för att välja vedtak; länkar och typnamn finns i
+        # uppslaget på vedtakid. Utan den gallringen närmar sig svaret MCP:s
+        # storleksgräns redan utan beslutstexter.
+        vedtak_liste = [
+            {k: v[k] for k in _VEDTAK_LISTFALT} | {"vedtakstekst": v["vedtakstekst"]}
+            for v in st.hamta_vedtak_liste(sesjonid)
+        ]
+        budget = NOR_MAX_TECKEN
+        utelamnade = 0
+        for v in vedtak_liste:
+            tekst = v.pop("vedtakstekst", "")
+            if not med_fulltext:
+                continue
+            if len(tekst) <= budget:
+                v["fulltext_md"] = tekst
+                budget -= len(tekst)
+            else:
+                v["fulltext_utelamnad"] = True
+                utelamnade += 1
 
-        return {
+        svar = {
             "sesjonid":     sesjonid,
             "antal":        len(vedtak_liste),
             "vedtak_liste": vedtak_liste,
         }
+        if utelamnade:
+            svar["notat"] = (
+                f"Beslutstexten är utelämnad för {utelamnade} av "
+                f"{len(vedtak_liste)} vedtak (samlat teckentak "
+                f"{NOR_MAX_TECKEN}). Hämta dem enskilt med "
+                f"nor_hamta_vedtak(vedtakid=..., sesjonid='{sesjonid}')."
+            )
+        return svar
 
     except Exception as exc:
         log.error("nor_hamta_vedtak misslyckades: %s", exc)
