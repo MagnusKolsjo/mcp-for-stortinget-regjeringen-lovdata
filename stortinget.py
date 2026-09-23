@@ -106,13 +106,22 @@ def _throttle() -> None:
     global _hink_tokens, _hink_senast
     with _hink_las:
         nu = time.monotonic()
-        _hink_tokens = min(
-            _HINK_STORLEK, _hink_tokens + (nu - _hink_senast) * _TAKT_PER_S
-        )
-        _hink_senast = nu
+        # Under en 429-paus fylls hinken inte på: tiden räknas från pausens
+        # slut, och anrop som köar under pausen får var sin plats efter den i
+        # takt med _TAKT_PER_S i stället för att släppas samtidigt.
+        start = max(nu, _paus_till)
+        if start > _hink_senast:
+            _hink_tokens = min(
+                _HINK_STORLEK, _hink_tokens + (start - _hink_senast) * _TAKT_PER_S
+            )
+            _hink_senast = start
+        if nu < _paus_till:
+            # Inget sparat utrymme får släppas i klump när pausen tar slut:
+            # första anropet går vid pausens slut, resten i takt efter det.
+            _hink_tokens = min(_hink_tokens, 1.0)
         _hink_tokens -= 1.0
-        vanta = -_hink_tokens / _TAKT_PER_S if _hink_tokens < 0 else 0.0
-        vanta = max(vanta, _paus_till - nu)
+        skuld = -_hink_tokens / _TAKT_PER_S if _hink_tokens < 0 else 0.0
+        vanta = (_hink_senast - nu) + skuld
     if vanta > 0:
         log.debug("Anropstak: väntar %.1f s", vanta)
         time.sleep(vanta)
@@ -152,7 +161,7 @@ def _get(path: str, params: Optional[dict] = None) -> httpx.Response:
     _MAX_VANTAN_429_S, kastas StortingetTakFel med besked om när det går att
     försöka igen.
     """
-    global _paus_till
+    global _paus_till, _hink_tokens, _hink_senast
     url = f"{API_BASE}/{path}"
     for forsok in range(1, _MAX_FORSOK_429 + 1):
         _throttle()
@@ -163,8 +172,15 @@ def _get(path: str, params: Optional[dict] = None) -> httpx.Response:
         vanta = _tolka_retry_after(r.headers.get("Retry-After"))
         if vanta is None:
             vanta = _STANDARD_VANTAN_429_S
+        # Pausen begränsas till _MAX_VANTAN_429_S även när källan begär mer:
+        # då ger vi upp med ett fel nedan, och en längre paus skulle bara
+        # låsa alla senare anrop (Retry-After kan vara ett dygn).
         with _hink_las:
-            _paus_till = max(_paus_till, time.monotonic() + vanta)
+            nu = time.monotonic()
+            _paus_till = max(_paus_till, nu + min(vanta, _MAX_VANTAN_429_S))
+            # Hinken töms, så att takten efter pausen börjar från noll.
+            _hink_tokens = min(_hink_tokens, 0.0)
+            _hink_senast = max(_hink_senast, _paus_till)
 
         if vanta > _MAX_VANTAN_429_S or forsok == _MAX_FORSOK_429:
             raise StortingetTakFel(
