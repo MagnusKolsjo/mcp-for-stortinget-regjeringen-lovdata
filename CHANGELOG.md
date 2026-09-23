@@ -35,6 +35,10 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 - Lovdata-synken hoppar över ett paket vars `lastModified` i Lovdatas lista
   inte ändrats sedan förra synken, utan att ladda ned det.
 - `nor_embedding.py` embeddar Lovtidend bara med `--kilde lovtidend`.
+- `max_tecken=0` betyder upp till serverns övre tak på 200 000 tecken
+  (`NOR_TAK_TECKEN`) i stället för hela texten. Svaret skickas både som text
+  och som struktur, och en hel proposisjon gav annars nästan 2 MB. Resten
+  läses med `fran_tecken`.
 
 ### Tillagt
 
@@ -47,6 +51,10 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
   som ändrar författningen, nyast först, med `endrer` och `ikraft`.
 - Kolumnerna `endrer` och `ikraft` i `dokument`, tillagda som migrationer
   ovanpå det låsta bas-schemat.
+- `max_tecken` och `fran_tecken` i `nor_hamta_regjeringen` (standard 60 000
+  tecken). Kapade svar bär `tecken_totalt`, `trunkerad`,
+  `fortsatt_fran_tecken` och `las_vidare`, ett komplett anrop som börjar vid
+  utdragets faktiska slut. `nor_hamta_lovdokument` har också `las_vidare`.
 - HTTP 429 från Stortinget hanteras: `Retry-After` (sekunder eller
   HTTP-datum) respekteras och anropet görs om högst tre gånger.
 - Stortinget-anropen bär projektets User-Agent.

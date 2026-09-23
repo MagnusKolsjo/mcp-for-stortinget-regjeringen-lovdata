@@ -69,6 +69,13 @@ _SCRIPT_DIR = Path(__file__).parent.resolve()
 # sätta 0 för hela texten som ett uttryckligt val.
 NOR_MAX_TECKEN = int(os.getenv("NOR_MAX_TECKEN", "60000"))
 
+# Övre tak för ett enskilt textutdrag, även när anroparen ber om hela texten
+# (max_tecken=0). Svaret skickas två gånger — som text och som struktur — och
+# en proposisjon kan vara 600 000 tecken, vilket annars ger ett svar på
+# nästan 2 MB. 200 000 tecken håller svaret väl under 1 MB; resten läses med
+# fran_tecken.
+NOR_TAK_TECKEN = int(os.getenv("NOR_TAK_TECKEN", "200000"))
+
 # ── Query-expansion ────────────────────────────────────────────────────────────
 # Aktiveras via QUERY_EXPANSION_ENABLED=true i .env.
 # Stöder alla OpenAI-kompatibla endpoints (Claude, OpenAI, Ollama, LM Studio).
@@ -232,20 +239,28 @@ def _begransa_text(
       fortsatt_fran_tecken — värde att skicka som fran_tecken i nästa anrop,
                              eller None när texten är slut
 
-    max_tecken <= 0 betyder ingen trunkering. Klipper på ordgräns, aldrig
-    mitt i ett ord.
+    max_tecken <= 0 betyder så mycket som ryms under NOR_TAK_TECKEN, och
+    inget värde får gå över taket. Klipper på ordgräns, aldrig mitt i ett ord.
+
+    fortsatt_fran_tecken är utdragets faktiska slut. Kapningen på ordgräns
+    gör utdraget kortare än max_tecken, så fran_tecken + max_tecken skulle
+    hoppa över det avkapade ordet.
     """
     text = text or ""
     totalt = len(text)
     start  = max(0, min(fran_tecken, totalt))
     rest   = text[start:]
+    if max_tecken <= 0 or max_tecken > NOR_TAK_TECKEN:
+        max_tecken = NOR_TAK_TECKEN
 
-    if max_tecken and max_tecken > 0 and len(rest) > max_tecken:
+    if len(rest) > max_tecken:
         utdrag    = rest[:max_tecken]
         brytpunkt = max(utdrag.rfind(" "), utdrag.rfind("\n"))
         if brytpunkt > max_tecken * 0.6:
             utdrag = utdrag[:brytpunkt]
-        utdrag = utdrag.rstrip()
+        # Ett utdrag av bara blanktecken skulle ge slut == start, och
+        # fortsättningen skulle peka på samma ställe igen.
+        utdrag = utdrag.rstrip() or rest[:max_tecken]
         trunkerad = True
     else:
         utdrag    = rest
@@ -360,6 +375,7 @@ class LovdokumentSvar(TypedDict):
     fortsatt_fran_tecken: int | None
     endrer: NotRequired[list[str]]
     ikraft: NotRequired[str | None]
+    las_vidare: NotRequired[str]
 
 
 class SamladSokSvar(TypedDict):
@@ -392,6 +408,10 @@ class RegjeringenSvar(TypedDict):
     fulltext_md: str | None
     kalla: str
     tecken_antal: int
+    tecken_totalt: int
+    trunkerad: bool
+    fortsatt_fran_tecken: int | None
+    las_vidare: NotRequired[str]
     fel: str | None
 
 
@@ -546,7 +566,8 @@ def nor_hamta_dokument(
                   att se vilka publikationer saken har, och hämta sedan en i taget.
       publikasjon — Hämta bara EN publikation ur saken. Ange dess eksport_id
                   eller lenke_url ur publikasjon_referanse_liste. Tom = alla.
-      max_tecken — Teckentak per publikations fulltext (0 = ingen trunkering).
+      max_tecken — Teckentak per publikations fulltext (0 = upp till serverns
+                  övre tak på 200 000 tecken; resten läses med fran_tecken).
                   Varje trunkerat dokument får fälten trunkerad, tecken_totalt,
                   tecken_visade och fortsatt_fran_tecken.
       fran_tecken — Börja fulltexten vid denna teckenposition (paginering).
@@ -920,7 +941,8 @@ def nor_hamta_lovdokument(
                     eller beteckning 'LOV-2005-05-20-28'. En beteckning ger
                     den gällande texten; den kungjorda versionen i Lovtidend
                     hämtas med sitt id, t.ex. 'LTI/lov/2026-01-23-1'.
-      max_tecken  — Teckentak för fulltext_md (0 = ingen trunkering).
+      max_tecken  — Teckentak för fulltext_md (0 = upp till serverns övre
+                    tak på 200 000 tecken; resten läses med fran_tecken).
                     Rekommenderat för stora dokument — föreskrifter kan vara
                     100 000+ tecken. Exempel: max_tecken=20000 för en inledande
                     läsning.
@@ -979,6 +1001,11 @@ def nor_hamta_lovdokument(
             "fortsatt_fran_tecken": utdrag["fortsatt_fran_tecken"],
             **({"endrer": (rad[7] or "").split(), "ikraft": rad[8]}
                if rad[3] == "lovtidend" else {}),
+            **({"las_vidare": (
+                    f'nor_hamta_lovdokument(lovdata_id="{rad[0]}", '
+                    f'max_tecken={max_tecken}, '
+                    f'fran_tecken={utdrag["fortsatt_fran_tecken"]})')}
+               if utdrag["fortsatt_fran_tecken"] is not None else {}),
         }
 
     except Exception as exc:
@@ -1091,7 +1118,8 @@ def nor_sok_i_dokument(
       fraga      — Vad du söker efter. Kommaseparerade termer = OR mellan dem;
                    flera ord inom en term = AND (alla orden måste förekomma).
       max_treff  — Max antal matchande avsnitt att returnera (standard 10).
-      max_tecken — Teckentak per träff (standard 1500, 0 = hela avsnittet).
+      max_tecken — Teckentak per träff (standard 1500, 0 = hela avsnittet upp
+                   till serverns övre tak).
 
     Returnerar:
       Lista med matchande avsnitt ur fulltext_md, med rubrik och text.
@@ -1239,8 +1267,40 @@ def _hamta_regjeringen_fra_db(url: str) -> Optional[dict]:
         return None
 
 
+def _regjeringen_svar(
+    data: dict, kalla: str, url: str, max_tecken: int, fran_tecken: int
+) -> "RegjeringenSvar":
+    """Bygger svaret med ett begränsat textutdrag och en läs vidare-rad."""
+    utdrag = _begransa_text(data.get("fulltext_md"), max_tecken, fran_tecken)
+    svar: RegjeringenSvar = {
+        "tittel":               data.get("tittel"),
+        "beteckning":           data.get("beteckning"),
+        "dok_type":             data.get("dok_type"),
+        "url":                  data.get("url") or url,
+        "pdf_url":              data.get("pdf_url"),
+        "fulltext_md":          utdrag["text"],
+        "kalla":                kalla,
+        "tecken_antal":         utdrag["tecken_visade"],
+        "tecken_totalt":        utdrag["tecken_totalt"],
+        "trunkerad":            utdrag["trunkerad"],
+        "fortsatt_fran_tecken": utdrag["fortsatt_fran_tecken"],
+        "fel":                  None,
+    }
+    if utdrag["fortsatt_fran_tecken"] is not None:
+        svar["las_vidare"] = (
+            f'nor_hamta_regjeringen(url="{url}", max_tecken={max_tecken}, '
+            f'fran_tecken={utdrag["fortsatt_fran_tecken"]})'
+        )
+    return svar
+
+
 @mcp.tool(title="Hämta dokument från regjeringen.no", annotations=LASNING_EXTERN)
-def nor_hamta_regjeringen(url: str, spara_i_db: bool = True) -> RegjeringenSvar:
+def nor_hamta_regjeringen(
+    url: str,
+    spara_i_db: bool = True,
+    max_tecken: int = NOR_MAX_TECKEN,
+    fran_tecken: int = 0,
+) -> RegjeringenSvar:
     """
     Hämtar en proposisjon, NOU eller Meld. St. direkt från regjeringen.no.
 
@@ -1256,6 +1316,12 @@ def nor_hamta_regjeringen(url: str, spara_i_db: bool = True) -> RegjeringenSvar:
                     - Protokollrelativ: //www.regjeringen.no/id/...
       spara_i_db — Spara extraherad text i lokal databas (standard: true).
                    Sätt false bara för engångsanvändning där cachning inte är önskvärt.
+      max_tecken — Teckentak för fulltext_md (standard 60 000; 0 = upp till
+                   serverns övre tak på 200 000 tecken). En proposisjon kan
+                   vara flera hundra tusen tecken.
+      fran_tecken — Börja texten vid denna teckenposition. Skicka värdet ur
+                   fortsatt_fran_tecken för att läsa vidare. Databasen får
+                   alltid hela texten; taket gäller bara svaret.
 
     KÄLLA — hur man hittar URL:en per dokumenttyp:
       Proposisjon (Prop.)
@@ -1277,9 +1343,13 @@ def nor_hamta_regjeringen(url: str, spara_i_db: bool = True) -> RegjeringenSvar:
       dok_type     — 'proposisjon', 'nou' eller 'meld_st'
       url          — Slutlig URL efter omdirigeringar
       pdf_url      — URL till PDF (None om hämtad från cache; tillgänglig vid live-hämtning)
-      fulltext_md  — Extraherad text i Markdown-format
+      fulltext_md  — Extraherad text i Markdown-format (utdraget)
       kalla        — 'db_cache' om hämtad från lokal databas, 'live' om hämtad nyss
-      tecken_antal — Antal tecken i fulltext_md
+      tecken_antal — Antal tecken i fulltext_md (utdraget)
+      tecken_totalt, trunkerad, fortsatt_fran_tecken — hela textens längd,
+                     om utdraget är kapat och var nästa utdrag börjar (null
+                     när texten är slut)
+      las_vidare   — komplett anrop för nästa utdrag, när texten är kapad
       fel          — null vid framgång
 
     Går dokumentet inte att hämta ges ett verktygsfel med orsaken. Det
@@ -1294,13 +1364,9 @@ def nor_hamta_regjeringen(url: str, spara_i_db: bool = True) -> RegjeringenSvar:
         # Strategi 1: returnera från DB-cache om fulltext redan finns
         cached = _hamta_regjeringen_fra_db(url)
         if cached:
-            return {
-                **cached,
-                "pdf_url":      None,
-                "kalla":        "db_cache",
-                "tecken_antal": len(cached["fulltext_md"]),
-                "fel":          None,
-            }
+            return _regjeringen_svar(
+                {**cached, "pdf_url": None}, "db_cache", url, max_tecken, fran_tecken
+            )
 
         # Strategi 2: hämta live (PDF → markdown → eventuell OCR)
         data = rg.hamta_og_ekstraher(url)
@@ -1330,9 +1396,7 @@ def nor_hamta_regjeringen(url: str, spara_i_db: bool = True) -> RegjeringenSvar:
             except Exception as db_exc:
                 log.warning("Databasskrivning (nor_hamta_regjeringen) misslyckades: %s", db_exc)
 
-        data["kalla"]        = "live"
-        data["tecken_antal"] = len(data.get("fulltext_md") or "")
-        return data
+        return _regjeringen_svar(data, "live", url, max_tecken, fran_tecken)
 
     except Exception as exc:
         raise _verktygsfel(exc, f"Hämtningen från regjeringen.no ({url})") from exc
@@ -1448,7 +1512,8 @@ def nor_hamta_horinginnspill(
       med_fulltext — Ta med varje innspills text (standard: True). Sätt False
                      för att bara få avsändare och rubriker — ett litet svar
                      när du bara vill se vilka som yttrat sig.
-      max_tecken   — Teckentak per innspill (standard 4000, 0 = hela texten).
+      max_tecken   — Teckentak per innspill (standard 4000, 0 = hela texten upp
+                     till serverns övre tak).
                      En høring kan ha tjugo innspill på flera tusen tecken var.
 
     Returnerar:
