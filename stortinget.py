@@ -21,15 +21,20 @@ Två XML-dialekter används:
        - 2016-17+, övriga:     innstillinger.dtd  → rot: <Innstilling>, <Lovvedtak>, ...
        - Pre-2016-17:          äldre elementstruktur
 
-Takbegränsning: 100 anrop/minut (respekteras automatiskt via token-bucket).
+Anropstak: Stortinget tillåter 100 anrop/minut. Klienten håller sig under
+taket med en tokenhink (standard 90/minut) och respekterar Retry-After när
+källan ändå svarar HTTP 429.
 
-API-dokumentation: https://data.stortinget.no/dokumentasjon
+API-dokumentation: https://data.stortinget.no/dokumentasjon-og-hjelp/
 """
 
 import logging
 import os
 import re
+import threading
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Optional
 
@@ -42,34 +47,136 @@ load_dotenv(Path(__file__).parent / ".env")
 log = logging.getLogger(__name__)
 
 API_BASE    = os.getenv("STORTINGET_API_BASE", "https://data.stortinget.no/eksport")
-RATE_LIMIT  = int(os.getenv("STORTINGET_RATE_LIMIT", 100))   # anrop/minut
+
+# Källans tak är 100 anrop/minut. 90 lämnar marginal för klockdrift och för
+# att taket räknas på källans sida, inte vår.
+RATE_LIMIT  = int(os.getenv("STORTINGET_RATE_LIMIT", "90"))   # anrop/minut
 
 # Namespace för metadata-XML
 NS = "http://data.stortinget.no"
 NP = f"{{{NS}}}"   # prefix-sträng: {http://data.stortinget.no}
 
-# Token-bucket för rate-limiting
-_bucket_tokens  = float(RATE_LIMIT)
-_bucket_last_ts = time.monotonic()
+_USER_AGENT = (
+    "mcp-for-stortinget-regjeringen-lovdata "
+    "(+https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata)"
+)
+
+# Delad klient: httpx.Client är trådsäker för anrop, och headers sätts bara här.
+_KLIENT = httpx.Client(headers={"User-Agent": _USER_AGENT}, timeout=60)
+
+# ---------------------------------------------------------------------------
+# Anropstak
+#
+# En tokenhink släpper igenom högst (hinkens storlek + takten × 60 s) anrop
+# under en godtycklig minut. Med en hink lika stor som takten blir det nära
+# dubbla taket direkt efter en vilopaus, så hinken hålls liten: 10 platser
+# vid 90/minut ger högst 100 anrop under varje rullande minut. Den startar
+# halvfull, så att inte heller första minuten efter start kan överskrida taket.
+# ---------------------------------------------------------------------------
+
+_TAKT_PER_S   = max(RATE_LIMIT, 1) / 60.0
+_HINK_STORLEK = float(min(10, max(RATE_LIMIT, 1)))
+
+_hink_las    = threading.Lock()
+_hink_tokens = _HINK_STORLEK / 2
+_hink_senast = time.monotonic()
+# Tidpunkt (monotonic) före vilken inga anrop får göras, satt av ett 429-svar.
+_paus_till   = 0.0
+
+# 429-hantering: antal försök totalt, och längsta väntan vi accepterar innan
+# vi hellre ger upp med ett tydligt fel än låter ett verktygsanrop hänga.
+_MAX_FORSOK_429   = 3
+_MAX_VANTAN_429_S = 60.0
+_STANDARD_VANTAN_429_S = 30.0
 
 
 # ---------------------------------------------------------------------------
 # HTTP-primitiver
 # ---------------------------------------------------------------------------
 
-def _throttle():
-    global _bucket_tokens, _bucket_last_ts
-    now     = time.monotonic()
-    elapsed = now - _bucket_last_ts
-    _bucket_tokens   = min(RATE_LIMIT, _bucket_tokens + elapsed * (RATE_LIMIT / 60.0))
-    _bucket_last_ts  = now
-    if _bucket_tokens < 1:
-        sleep_s = (1 - _bucket_tokens) / (RATE_LIMIT / 60.0)
-        log.debug("Rate-limit nådd, väntar %.1f s", sleep_s)
-        time.sleep(sleep_s)
-        _bucket_tokens = 0.0
-    else:
-        _bucket_tokens -= 1.0
+def _throttle() -> None:
+    """
+    Väntar tills ett anrop får göras enligt tokenhinken.
+
+    Verktygen körs på arbetstrådar, så hinken skyddas av ett lås. Tråden
+    reserverar sin token inne i låset (saldot får bli negativt) och sover
+    utanför det; då väntar samtidiga anrop i tur och ordning i stället för
+    att alla vakna samtidigt och gå förbi taket.
+    """
+    global _hink_tokens, _hink_senast
+    with _hink_las:
+        nu = time.monotonic()
+        _hink_tokens = min(
+            _HINK_STORLEK, _hink_tokens + (nu - _hink_senast) * _TAKT_PER_S
+        )
+        _hink_senast = nu
+        _hink_tokens -= 1.0
+        vanta = -_hink_tokens / _TAKT_PER_S if _hink_tokens < 0 else 0.0
+        vanta = max(vanta, _paus_till - nu)
+    if vanta > 0:
+        log.debug("Anropstak: väntar %.1f s", vanta)
+        time.sleep(vanta)
+
+
+def _tolka_retry_after(varde: Optional[str]) -> Optional[float]:
+    """
+    Tolkar Retry-After som sekunder. Headern får enligt HTTP vara antingen ett
+    heltal sekunder eller ett HTTP-datum. Returnerar None om den saknas eller
+    inte går att tolka.
+    """
+    if not varde:
+        return None
+    varde = varde.strip()
+    if varde.isdigit():
+        return float(varde)
+    try:
+        tidpunkt = parsedate_to_datetime(varde)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if tidpunkt.tzinfo is None:
+        tidpunkt = tidpunkt.replace(tzinfo=timezone.utc)
+    return max(0.0, (tidpunkt - datetime.now(timezone.utc)).total_seconds())
+
+
+class StortingetTakFel(Exception):
+    """Stortinget svarade HTTP 429 även efter att Retry-After respekterats."""
+
+
+def _get(path: str, params: Optional[dict] = None) -> httpx.Response:
+    """
+    GET mot API_BASE/{path} inom anropstaket, med 429-hantering.
+
+    Vid 429 pausas alla trådar till den tid Retry-After anger (eller
+    _STANDARD_VANTAN_429_S om headern saknas), och anropet görs om. Efter
+    _MAX_FORSOK_429 försök, eller om källan begär längre väntan än
+    _MAX_VANTAN_429_S, kastas StortingetTakFel med besked om när det går att
+    försöka igen.
+    """
+    global _paus_till
+    url = f"{API_BASE}/{path}"
+    for forsok in range(1, _MAX_FORSOK_429 + 1):
+        _throttle()
+        r = _KLIENT.get(url, params=params or {})
+        if r.status_code != 429:
+            return r
+
+        vanta = _tolka_retry_after(r.headers.get("Retry-After"))
+        if vanta is None:
+            vanta = _STANDARD_VANTAN_429_S
+        with _hink_las:
+            _paus_till = max(_paus_till, time.monotonic() + vanta)
+
+        if vanta > _MAX_VANTAN_429_S or forsok == _MAX_FORSOK_429:
+            raise StortingetTakFel(
+                f"Stortinget begränsar anropstakten (HTTP 429) och ber om "
+                f"{vanta:.0f} sekunders paus. Försök igen om en stund; "
+                f"källans tak är 100 anrop per minut."
+            )
+        log.warning(
+            "Stortinget svarade 429 på %s (försök %d/%d) — väntar %.0f s",
+            path, forsok, _MAX_FORSOK_429, vanta,
+        )
+    raise AssertionError("oåtkomlig")  # loopen returnerar eller kastar alltid
 
 
 class StortingetFel(Exception):
@@ -85,9 +192,7 @@ class StortingetFel(Exception):
 
 def _get_xml_root(path: str, params: Optional[dict] = None) -> etree._Element:
     """GET mot API_BASE/{path} — returnerar lxml-rot."""
-    _throttle()
-    url = f"{API_BASE}/{path}"
-    r = httpx.get(url, params=params or {}, timeout=60)
+    r = _get(path, params)
 
     parser = etree.XMLParser(recover=True, load_dtd=False, no_network=True)
 
@@ -110,9 +215,7 @@ def _get_xml_root(path: str, params: Optional[dict] = None) -> etree._Element:
 
 def _get_xml_text(path: str, params: Optional[dict] = None) -> str:
     """GET mot API_BASE/{path} — returnerar råa XML-bytes som sträng (för fulltext)."""
-    _throttle()
-    url = f"{API_BASE}/{path}"
-    r = httpx.get(url, params=params or {}, timeout=60)
+    r = _get(path, params)
     r.raise_for_status()
     return r.text
 
@@ -902,9 +1005,7 @@ def hamta_vedtak_fulltext(vedtakid: str) -> dict:
     Returnerar dict med: id, tittel, fulltext_md, url.
     fulltext_md är extraherad beslutstext (kan vara HTML med beslutsspråk).
     """
-    _throttle()
-    url = f"{API_BASE}/stortingsvedtak"
-    r   = httpx.get(url, params={"vedtakid": vedtakid}, timeout=60)
+    r = _get("stortingsvedtak", {"vedtakid": vedtakid})
     r.raise_for_status()
 
     content_type = r.headers.get("content-type", "").lower()

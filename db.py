@@ -91,7 +91,7 @@ def initiera_schema():
     Säker att köra många gånger — schemat är idempotent.
 
     Loggar varning och returnerar utan att kasta om DB är otillgänglig,
-    så att MCP-servern står kvar i Claude Desktop även när Postgres-containern
+    så att MCP-servern står kvar i MCP-klienten även när Postgres-containern
     är nere. Verktygsanrop felar i så fall tills DB kommer upp igen.
     """
     if not DATABASE_URL:
