@@ -25,42 +25,43 @@ Datakällor:
   Lovdata      — gratis bulk-nedladdning (daglig synk)
   regjeringen  — proposisjoner och NOU som PDF (PDF-extraktion + OCR)
 
-Transport-lägen (styrs via MCP_TRANSPORT i .env):
+Transport (MCP_TRANSPORT i .env, se mcp_transport.py):
 
-  stdio (lokal användning):
+  stdio — lokal MCP-klient, som startar processen direkt:
     python3 mcp_server.py
-    MCP-klienten startar och hanterar processen direkt.
 
-  http (hostad driftsättning):
-    MCP_TRANSPORT=http python3 mcp_server.py
-    Servern lyssnar på MCP_HOST:MCP_PORT (standard 127.0.0.1:8003).
-    Sätt MCP_API_KEY för Bearer-token-autentisering.
+  http — delad drift bakom en URL (Streamable HTTP):
+    MCP_TRANSPORT=http MCP_API_KEY=<NYCKEL> python3 mcp_server.py
+    Servern lyssnar på MCP_HOST:MCP_PORT (standard 127.0.0.1:8003) och
+    kräver MCP_API_KEY; utan nyckel startar den inte.
 
 Konfiguration via .env (se config.example.env).
 """
 
 import logging
 import os
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, NotRequired, Optional, TypedDict
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
 
-import stortinget as st
-import regjeringen as rg
-from db import initiera_schema
-
+# .env läses före de egna modulerna, som läser sin konfiguration vid import.
 load_dotenv(Path(__file__).parent / ".env")
+
+import httpx
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+
+import regjeringen as rg
+import stortinget as st
+from db import _ar_postgres, initiera_schema
+from mcp_annotationer import CACHE_HINTAR, LASNING_DB, LASNING_EXTERN
+from mcp_transport import starta
 
 # ── Konfiguration ──────────────────────────────────────────────────────────────
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
-
-MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio").lower()
-MCP_HOST      = os.getenv("MCP_HOST",      "127.0.0.1")
-MCP_PORT      = int(os.getenv("MCP_PORT",  "8003"))
-MCP_API_KEY   = os.getenv("MCP_API_KEY",   "")
 
 # Standardtak för fulltext i hämtverktygen. Utan ett tak som gäller by default
 # kan ett anrop mot ett stort dokument överskrida MCP-protokollets storleksgräns
@@ -82,7 +83,8 @@ QUERY_EXPANSION_PROMPT_FILE = os.getenv(
 
 # ── Embeddingmodell ────────────────────────────────────────────────────────────
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "NbAiLab/nb-sbert-base")
-_embedding_modell = None   # Laddas vid första semantisk sökning
+_embedding_modell = None   # Laddas vid första semantiska sökning
+_embedding_las = threading.Lock()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,8 +95,10 @@ log = logging.getLogger(__name__)
 
 # ── MCP-server ─────────────────────────────────────────────────────────────────
 
-mcp = FastMCP(
+mcp = MCPServer(
     "norge",
+    version="1.1.0",
+    cache_hints=CACHE_HINTAR,
     instructions=(
         "MCP-server för norsk riksdags- och rättsdata. "
         "Täcker Stortinget (1986-87–idag), norska lagar och föreskrifter (Lovdata), "
@@ -130,15 +134,42 @@ mcp = FastMCP(
 # uppslag på beteckning eller titel ska den gällande texten komma först.
 _LOVTIDEND_SIST = "CASE WHEN dok_type = 'lovtidend' THEN 1 ELSE 0 END"
 
-# Cachad sessionsrespons (hämtas vid behov, återanvänds)
+# Sessionslistan hämtas en gång och återanvänds. Verktygen körs på
+# arbetstrådar, så hämtningen skyddas av ett lås med dubbelkontroll.
 _sesjoner_cache: Optional[dict] = None
+_sesjoner_las = threading.Lock()
 
 
 def _sesjoner() -> dict:
     global _sesjoner_cache
     if _sesjoner_cache is None:
-        _sesjoner_cache = st.hamta_sesjoner()
+        with _sesjoner_las:
+            if _sesjoner_cache is None:
+                _sesjoner_cache = st.hamta_sesjoner()
     return _sesjoner_cache
+
+
+def _verktygsfel(exc: Exception, sammanhang: str) -> ToolError:
+    """
+    Översätter ett undantag till ToolError med ett begripligt meddelande.
+
+    Utan översättning får klienten bara "Error executing tool" utan orsak.
+    Förväntade fel (okänd identifierare, anropstak, nätverksfel) får ett
+    eget besked; oväntade loggas med spår och rapporteras med sin text.
+    """
+    if isinstance(exc, ToolError):
+        return exc
+    if isinstance(exc, (st.StortingetFel, st.StortingetTakFel)):
+        return ToolError(str(exc))
+    if isinstance(exc, httpx.HTTPStatusError):
+        return ToolError(
+            f"{sammanhang}: källan svarade HTTP {exc.response.status_code} "
+            f"för {exc.request.url}."
+        )
+    if isinstance(exc, httpx.HTTPError):
+        return ToolError(f"{sammanhang}: källan svarade inte ({exc}). Försök igen senare.")
+    log.exception("%s misslyckades", sammanhang)
+    return ToolError(f"{sammanhang} misslyckades: {exc}")
 
 
 def expandera_fraga(fraga: str) -> list[str]:
@@ -231,31 +262,175 @@ def _begransa_text(
 
 
 def _hamta_embedding_modell():
-    """Laddar embeddingmodellen vid behov (lat laddning, FD1-skyddad)."""
+    """
+    Laddar embeddingmodellen vid första behov.
+
+    Dubbelkontrollerad låsning: flera sökanrop kan komma samtidigt på olika
+    trådar, och utan låset kunde två av dem ladda modellen var för sig.
+    Utskrifter från modellbiblioteken kan inte störa stdio-protokollet: SDK:n
+    leder om fildeskriptor 1 till stderr och skriver protokollet på en egen
+    kopia.
+    """
     global _embedding_modell
     if _embedding_modell is None:
-        import os as _os
-        log_path = _SCRIPT_DIR / "logs" / "embedding.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_fd   = _os.open(str(log_path), _os.O_WRONLY | _os.O_APPEND | _os.O_CREAT)
-        save_fd1 = _os.dup(1)
-        try:
-            _os.dup2(log_fd, 1)
-            from sentence_transformers import SentenceTransformer
-            _embedding_modell = SentenceTransformer(EMBEDDING_MODEL)
-        finally:
-            _os.dup2(save_fd1, 1)
-            _os.close(save_fd1)
-            _os.close(log_fd)
-        log.info("Embeddingmodell laddad: %s", EMBEDDING_MODEL)
+        with _embedding_las:
+            if _embedding_modell is None:
+                from sentence_transformers import SentenceTransformer
+                _embedding_modell = SentenceTransformer(EMBEDDING_MODEL)
+                log.info("Embeddingmodell laddad: %s", EMBEDDING_MODEL)
     return _embedding_modell
+
+
+def _forvarm_http() -> None:
+    """Laddar embeddingmodellen före första anropet i http-läget (bara med Postgres)."""
+    if _ar_postgres():
+        try:
+            _hamta_embedding_modell()
+        except Exception as exc:
+            log.warning("Embeddingmodellen kunde inte laddas i förväg: %s", exc)
+
+
+# ── Svarstyper ─────────────────────────────────────────────────────────────────
+#
+# Typerna ger klienten ett utdataschema. Svaret valideras mot typen, så fält
+# som kan saknas eller vara null i källdatan är NotRequired eller "| None".
+# Heterogena poster (saker, träffar, publikationer) typas som dict[str, Any];
+# det stabila skalet runt dem typas fullt ut.
+
+Post = dict[str, Any]
+
+
+class SesjonerSvar(TypedDict):
+    innevaerende: str
+    sesjoner: list[Post]
+    antal: int
+
+
+class StortingetSokSvar(TypedDict):
+    fraga: str
+    sesjonid: str
+    saker: NotRequired[list[Post]]
+    saker_antal: NotRequired[int]
+    sporsmal: NotRequired[list[Post]]
+    sporsmal_antal: NotRequired[int]
+    horinger: NotRequired[list[Post]]
+    horinger_antal: NotRequired[int]
+
+
+class DokumentSvar(TypedDict):
+    sesjonid: str
+    dokument: list[Post]
+    sakid: NotRequired[str]
+    publikasjonid: NotRequired[str]
+    sak: NotRequired[Post]
+    publikasjoner: NotRequired[list[Post]]
+    regjeringen_url: NotRequired[str]
+    notat: NotRequired[str]
+
+
+class PublikasjonerSvar(TypedDict):
+    sakid: str
+    tittel: str
+    sesjonid: str
+    dokumentgruppe: str
+    sak_status: str
+    antal: int
+    publikasjoner: list[Post]
+    regjeringen_url: str
+    notat: NotRequired[str]
+
+
+class TraffSvar(TypedDict):
+    fraga: str
+    antal: int
+    treff: list[Post]
+
+
+class LovdokumentSvar(TypedDict):
+    lovdata_id: str | None
+    beteckning: str | None
+    tittel: str | None
+    dok_type: str | None
+    dato: str | None
+    url: str | None
+    fulltext_md: str | None
+    tecken_totalt: int
+    tecken_visade: int
+    trunkerad: bool
+    fortsatt_fran_tecken: int | None
+    endrer: NotRequired[list[str]]
+    ikraft: NotRequired[str | None]
+
+
+class SamladSokSvar(TypedDict):
+    fraga: str
+    stortinget: Post
+    lovdata: Post
+    regjeringen: Post
+
+
+class SokIDokumentSvar(TypedDict):
+    identifierare: str
+    lovdata_id: str | None
+    beteckning: str | None
+    tittel: str
+    kilde: str | None
+    publikasjonid: str | None
+    url: str | None
+    fraga: str
+    antal: int
+    avsnitt_totalt: int
+    treff: list[Post]
+
+
+class RegjeringenSvar(TypedDict):
+    tittel: str | None
+    beteckning: str | None
+    dok_type: str | None
+    url: str | None
+    pdf_url: str | None
+    fulltext_md: str | None
+    kalla: str
+    tecken_antal: int
+    fel: str | None
+
+
+class VedtakSvar(TypedDict):
+    sesjonid: str
+    vedtakid: NotRequired[str]
+    vedtak: NotRequired[Post]
+    antal: NotRequired[int]
+    vedtak_liste: NotRequired[list[Post]]
+    notat: NotRequired[str]
+
+
+class InnspillSvar(TypedDict):
+    horingid: str
+    antal: int
+    innspill: list[Post]
+    notat: NotRequired[str]
+
+
+class EmnerSvar(TypedDict):
+    antal: int
+    toppnivaa: list[Post]
+    undernivaa: list[Post]
+
+
+class SemantiskSvar(TypedDict):
+    fraga: str
+    expansion: list[str]
+    kilde: str
+    antal: int
+    treff: list[Post]
+    diagnostik: NotRequired[Post]
 
 
 # ── Verktyg ────────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
-def nor_lista_sesjoner() -> dict:
+@mcp.tool(title="Lista Stortingssesjoner", annotations=LASNING_EXTERN)
+def nor_lista_sesjoner() -> SesjonerSvar:
     """
     Listar alla tillgängliga Stortingssesjoner (43 st, 1986-87 och framåt).
 
@@ -265,11 +440,10 @@ def nor_lista_sesjoner() -> dict:
     try:
         return _sesjoner()
     except Exception as exc:
-        log.error("nor_lista_sesjoner misslyckades: %s", exc)
-        return {"fel": str(exc)}
+        raise _verktygsfel(exc, "Hämtningen av sesjoner") from exc
 
 
-@mcp.tool()
+@mcp.tool(title="Sök i Stortinget", annotations=LASNING_EXTERN)
 def nor_sok_stortinget(
     fraga: str,
     sesjonid: str = "",
@@ -278,7 +452,7 @@ def nor_sok_stortinget(
     emne: str = "",
     sak_status: str = "",
     max_treff: int = 10,
-) -> dict:
+) -> StortingetSokSvar:
     """
     Söker i Stortingets data för en given session.
 
@@ -342,11 +516,10 @@ def nor_sok_stortinget(
         return resultat
 
     except Exception as exc:
-        log.error("nor_sok_stortinget misslyckades: %s", exc)
-        return {"fel": str(exc), "fraga": fraga, "sesjonid": sesjonid}
+        raise _verktygsfel(exc, "Sökningen i Stortinget") from exc
 
 
-@mcp.tool()
+@mcp.tool(title="Hämta Stortinget-dokument", annotations=LASNING_EXTERN)
 def nor_hamta_dokument(
     id: str,
     id_typ: str = "sakid",
@@ -356,7 +529,7 @@ def nor_hamta_dokument(
     publikasjon: str = "",
     max_tecken: int = NOR_MAX_TECKEN,
     fran_tecken: int = 0,
-) -> dict:
+) -> DokumentSvar:
     """
     Hämtar metadata och fulltext för ett Stortinget-dokument.
 
@@ -381,8 +554,11 @@ def nor_hamta_dokument(
     Returnerar:
       sak        — Sakens metadata (tittel, status, emner, publikasjoner,
                    regjeringen_url)
-      dokument   — Lista av hämtade publikasjoner med fulltext_md
-      fel        — Eventuellt felmeddelande
+      dokument   — Lista av hämtade publikasjoner med fulltext_md. En
+                   publikation från regjeringen.no som inte gick att hämta
+                   bär fältet fel med orsaken.
+
+    Okänt id, okänd publikation och okänd id_typ ger ett verktygsfel.
 
     STORLEK: en sak kan ha många publikationer på vardera hundratusentals tecken.
     Utan begränsning kan svaret överskrida MCP:s storleksgräns och anropet
@@ -424,15 +600,14 @@ def nor_hamta_dokument(
                     if publikasjon in (p.get("eksport_id", ""), p.get("lenke_url", ""))
                 ]
                 if not valda:
-                    return {
-                        "fel": (
-                            f"Publikationen '{publikasjon}' finns inte bland sakens "
-                            f"{len(pub_referenser)} publikationsreferenser. Kör "
-                            f"nor_lista_publikasjoner('{id}') för att se giltiga värden."
-                        ),
-                        "sakid": id,
-                        "publikasjoner": pub_referenser,
-                    }
+                    giltiga = ", ".join(
+                        p.get("eksport_id") or p.get("lenke_url", "") for p in pub_referenser
+                    )
+                    raise ToolError(
+                        f"Publikationen '{publikasjon}' finns inte bland sakens "
+                        f"{len(pub_referenser)} publikationsreferenser ({giltiga}). "
+                        f"Kör nor_lista_publikasjoner('{id}') för att se dem."
+                    )
                 pub_referenser = valda
 
             for pub_ref in pub_referenser:
@@ -579,15 +754,14 @@ def nor_hamta_dokument(
             }
 
         else:
-            return {"fel": f"Okänd id_typ: '{id_typ}'. Använd 'sakid' eller 'publikasjonid'."}
+            raise ToolError(f"Okänd id_typ: '{id_typ}'. Använd 'sakid' eller 'publikasjonid'.")
 
     except Exception as exc:
-        log.error("nor_hamta_dokument misslyckades (id=%s, typ=%s): %s", id, id_typ, exc)
-        return {"fel": str(exc), "id": id, "id_typ": id_typ}
+        raise _verktygsfel(exc, f"Hämtningen av dokument {id}") from exc
 
 
-@mcp.tool()
-def nor_lista_publikasjoner(sakid: str) -> dict:
+@mcp.tool(title="Lista en saks publikationer", annotations=LASNING_EXTERN)
+def nor_lista_publikasjoner(sakid: str) -> PublikasjonerSvar:
     """
     Listar en saks publikationsreferenser — utan fulltext.
 
@@ -631,8 +805,7 @@ def nor_lista_publikasjoner(sakid: str) -> dict:
             )
         return svar
     except Exception as exc:
-        log.error("nor_lista_publikasjoner misslyckades (sakid=%s): %s", sakid, exc)
-        return {"fel": str(exc), "sakid": sakid}
+        raise _verktygsfel(exc, f"Hämtningen av sak {sakid}") from exc
 
 
 # Gällande rätt. 'alla' i nor_sok_lovdata och Lovdata-delen av nor_sok avser
@@ -640,12 +813,12 @@ def nor_lista_publikasjoner(sakid: str) -> dict:
 _GJELDENDE_TYPER = ("lov", "forskrift")
 
 
-@mcp.tool()
+@mcp.tool(title="Sök i Lovdata och Lovtidend", annotations=LASNING_DB)
 def nor_sok_lovdata(
     fraga: str,
     dok_type: str = "alla",
     max_treff: int = 10,
-) -> dict:
+) -> TraffSvar:
     """
     Söker i den lokala Lovdata-cachen: gällande norska lagar och forskrifter,
     och Norsk Lovtidend avd. I.
@@ -730,16 +903,15 @@ def nor_sok_lovdata(
         }
 
     except Exception as exc:
-        log.error("nor_sok_lovdata misslyckades: %s", exc)
-        return {"fel": str(exc), "fraga": fraga}
+        raise _verktygsfel(exc, "Sökningen i Lovdata-cachen") from exc
 
 
-@mcp.tool()
+@mcp.tool(title="Hämta Lovdata-dokument", annotations=LASNING_DB)
 def nor_hamta_lovdokument(
     lovdata_id: str,
     max_tecken: int = NOR_MAX_TECKEN,
     fran_tecken: int = 0,
-) -> dict:
+) -> LovdokumentSvar:
     """
     Hämtar fulltext och metadata för ett Lovdata-dokument ur lokal cache.
 
@@ -759,7 +931,7 @@ def nor_hamta_lovdokument(
     Returnerar:
       Metadata + fulltext_md för dokumentet, samt tecken_totalt, tecken_visade,
       trunkerad och fortsatt_fran_tecken.
-      fulltext_md är null om dokumentet inte finns i cachen — synka först.
+      Ett dokument som inte finns i cachen ger ett verktygsfel.
 
     Vill du hitta en enskild bestämmelse i stället för att läsa hela lagen —
     använd nor_sok_i_dokument.
@@ -784,11 +956,12 @@ def nor_hamta_lovdokument(
             rad = cur.fetchone()
 
         if not rad:
-            return {
-                "fel": f"Dokumentet '{lovdata_id}' finns inte i cachen. "
-                       "Kör lovdata_sync.py för att synka.",
-                "lovdata_id": lovdata_id,
-            }
+            raise ToolError(
+                f"Dokumentet '{lovdata_id}' finns inte i den lokala Lovdata-cachen. "
+                "Kontrollera identifieraren (t.ex. 'NL/lov/2005-06-17-62', "
+                "'LOV-2005-06-17-62' eller 'LTI/lov/2026-01-23-1'), sök med "
+                "nor_sok_lovdata, eller kör lovdata_sync.py om cachen är tom."
+            )
 
         utdrag = _begransa_text(rad[6], max_tecken, fran_tecken)
 
@@ -809,16 +982,15 @@ def nor_hamta_lovdokument(
         }
 
     except Exception as exc:
-        log.error("nor_hamta_lovdokument misslyckades (id=%s): %s", lovdata_id, exc)
-        return {"fel": str(exc), "lovdata_id": lovdata_id}
+        raise _verktygsfel(exc, f"Hämtningen av {lovdata_id} ur cachen") from exc
 
 
-@mcp.tool()
+@mcp.tool(title="Samlad sökning i norska källor", annotations=LASNING_EXTERN)
 def nor_sok(
     fraga: str,
     sesjonid: str = "",
     max_treff: int = 10,
-) -> dict:
+) -> SamladSokSvar:
     """
     Samlad sökning över alla norska källor: Stortinget (live API),
     Lovdata (lokal cache) och regjeringen.no (lokal cache).
@@ -835,6 +1007,9 @@ def nor_sok(
       stortinget  — Saker från Stortingets live-API
       lovdata     — Matchande gällande lagar och forskrifter från lokal cache
       regjeringen — Proposisjoner och NOU från lokal cache
+
+    Misslyckas en källa bär dess del fältet fel, medan de andra delarna
+    svarar som vanligt.
 
     Norsk Lovtidend ingår inte här; sök den med
     nor_sok_lovdata(dok_type='lovtidend').
@@ -893,17 +1068,16 @@ def nor_sok(
         return resultat
 
     except Exception as exc:
-        log.error("nor_sok misslyckades: %s", exc)
-        return {"fel": str(exc), "fraga": fraga}
+        raise _verktygsfel(exc, "Den samlade sökningen") from exc
 
 
-@mcp.tool()
+@mcp.tool(title="Sök inom ett cachat dokument", annotations=LASNING_DB)
 def nor_sok_i_dokument(
     lovdata_id: str,
     fraga: str,
     max_treff: int = 10,
     max_tecken: int = 1500,
-) -> dict:
+) -> SokIDokumentSvar:
     """
     Söker inom ett specifikt cachat dokument och returnerar matchande avsnitt.
 
@@ -955,17 +1129,13 @@ def nor_sok_i_dokument(
             rad = cur.fetchone()
 
         if not rad:
-            return {
-                "fel": (
-                    f"'{lovdata_id}' finns inte i den lokala cachen. Kontrollera "
-                    "identifieraren, eller hämta dokumentet först: Stortinget-"
-                    "dokument med nor_hamta_dokument, proposisjoner och NOU med "
-                    "nor_hamta_regjeringen. Lovdata-dokument kommer via den "
-                    "dagliga synken."
-                ),
-                "identifierare": lovdata_id,
-                "treff":         [],
-            }
+            raise ToolError(
+                f"'{lovdata_id}' finns inte i den lokala cachen. Kontrollera "
+                "identifieraren, eller hämta dokumentet först: Stortinget-"
+                "dokument med nor_hamta_dokument, proposisjoner och NOU med "
+                "nor_hamta_regjeringen. Lovdata-dokument kommer via den "
+                "dagliga synken."
+            )
 
         dok_id, beteckning, dok_tittel, fulltext, kilde, pub_id, url = rad
         fulltext   = fulltext or ""
@@ -974,21 +1144,12 @@ def nor_sok_i_dokument(
         if not fulltext:
             # Skilj "okänd identifierare" från "finns men saknar text" —
             # felmeddelandet ska visa vägen framåt.
-            return {
-                "identifierare": lovdata_id,
-                "lovdata_id":    dok_id,
-                "beteckning":    beteckning,
-                "tittel":        dok_tittel,
-                "kilde":         kilde,
-                "url":           url,
-                "fel": (
-                    "Dokumentet finns i cachen men har ingen extraherad fulltext. "
-                    "För regjeringen.no-dokument kan PDF-extraktionen ha "
-                    "misslyckats — kör nor_hamta_regjeringen(url=...) för att "
-                    "försöka igen."
-                ),
-                "treff": [],
-            }
+            raise ToolError(
+                f"Dokumentet '{dok_tittel or lovdata_id}' ({kilde}) finns i cachen "
+                "men har ingen extraherad fulltext. För regjeringen.no-dokument "
+                "kan PDF-extraktionen ha misslyckats — kör "
+                f"nor_hamta_regjeringen(url='{url}') för att försöka igen."
+            )
 
         # Dela upp i avsnitt (paragrafer avgränsas av ### i Markdown)
         termer    = [t.strip().lower() for t in fraga.split(",") if t.strip()]
@@ -1036,8 +1197,7 @@ def nor_sok_i_dokument(
         }
 
     except Exception as exc:
-        log.error("nor_sok_i_dokument misslyckades (id=%s): %s", lovdata_id, exc)
-        return {"fel": str(exc), "identifierare": lovdata_id, "treff": []}
+        raise _verktygsfel(exc, f"Sökningen i {lovdata_id}") from exc
 
 
 def _hamta_regjeringen_fra_db(url: str) -> Optional[dict]:
@@ -1079,8 +1239,8 @@ def _hamta_regjeringen_fra_db(url: str) -> Optional[dict]:
         return None
 
 
-@mcp.tool()
-def nor_hamta_regjeringen(url: str, spara_i_db: bool = True) -> dict:
+@mcp.tool(title="Hämta dokument från regjeringen.no", annotations=LASNING_EXTERN)
+def nor_hamta_regjeringen(url: str, spara_i_db: bool = True) -> RegjeringenSvar:
     """
     Hämtar en proposisjon, NOU eller Meld. St. direkt från regjeringen.no.
 
@@ -1120,7 +1280,11 @@ def nor_hamta_regjeringen(url: str, spara_i_db: bool = True) -> dict:
       fulltext_md  — Extraherad text i Markdown-format
       kalla        — 'db_cache' om hämtad från lokal databas, 'live' om hämtad nyss
       tecken_antal — Antal tecken i fulltext_md
-      fel          — Eventuellt felmeddelande (null vid framgång)
+      fel          — null vid framgång
+
+    Går dokumentet inte att hämta ges ett verktygsfel med orsaken. Det
+    gäller också när regjeringen.no blockerar automatiserad åtkomst med en
+    Cloudflare-utmaning; meddelandet visar då vilka vägar som fungerar.
 
     OBS: Vid första hämtningen av ett stort eller bildbaserat dokument kan
     OCR-fallbacken ta flera minuter och slå i MCP-timeouten. Efterföljande
@@ -1140,6 +1304,12 @@ def nor_hamta_regjeringen(url: str, spara_i_db: bool = True) -> dict:
 
         # Strategi 2: hämta live (PDF → markdown → eventuell OCR)
         data = rg.hamta_og_ekstraher(url)
+        if not data.get("fulltext_md"):
+            # hamta_og_ekstraher fångar själv sina fel, inklusive botskyddet,
+            # och lägger orsaken i fel. Här blir den ett verktygsfel.
+            raise ToolError(
+                data.get("fel") or f"Ingen text kunde extraheras ur {url}."
+            )
 
         if spara_i_db and data.get("fulltext_md"):
             try:
@@ -1165,24 +1335,18 @@ def nor_hamta_regjeringen(url: str, spara_i_db: bool = True) -> dict:
         return data
 
     except Exception as exc:
-        log.error("nor_hamta_regjeringen misslyckades (%s): %s", url, exc)
-        return {
-            "tittel": "", "beteckning": "", "dok_type": "proposisjon",
-            "url": url, "pdf_url": None, "fulltext_md": None,
-            "kalla": "fel", "tecken_antal": 0,
-            "fel": str(exc),
-        }
+        raise _verktygsfel(exc, f"Hämtningen från regjeringen.no ({url})") from exc
 
 
 _VEDTAK_LISTFALT = ("id", "nummer", "sak_id", "dato", "tittel", "vedtakstype")
 
 
-@mcp.tool()
+@mcp.tool(title="Hämta stortingsvedtak", annotations=LASNING_EXTERN)
 def nor_hamta_vedtak(
     sesjonid: str = "",
     vedtakid: str = "",
     med_fulltext: bool = False,
-) -> dict:
+) -> VedtakSvar:
     """
     Hämtar stortingsvedtak (parlamentariska beslut).
 
@@ -1219,16 +1383,12 @@ def nor_hamta_vedtak(
         if vedtakid:
             vedtak = st.hamta_vedtak(vedtakid, sesjonid)
             if vedtak is None:
-                return {
-                    "fel": (
-                        f"Vedtak {vedtakid} finns inte bland vedtaken i session "
-                        f"{sesjonid}. Stortinget har inget uppslag direkt på "
-                        f"vedtakid, så vedtaket söks bara i en session åt gången. "
-                        f"Ange sesjonid för den session vedtaket fattades i."
-                    ),
-                    "vedtakid": vedtakid,
-                    "sesjonid": sesjonid,
-                }
+                raise ToolError(
+                    f"Vedtak {vedtakid} finns inte bland vedtaken i session "
+                    f"{sesjonid}. Stortinget har inget uppslag direkt på "
+                    f"vedtakid, så vedtaket söks bara i en session åt gången. "
+                    f"Ange sesjonid för den session vedtaket fattades i."
+                )
             vedtak["fulltext_md"] = vedtak.pop("vedtakstekst", "")
             return {"vedtakid": vedtakid, "sesjonid": sesjonid, "vedtak": vedtak}
 
@@ -1268,16 +1428,15 @@ def nor_hamta_vedtak(
         return svar
 
     except Exception as exc:
-        log.error("nor_hamta_vedtak misslyckades: %s", exc)
-        return {"fel": str(exc), "sesjonid": sesjonid, "vedtakid": vedtakid}
+        raise _verktygsfel(exc, "Hämtningen av vedtak") from exc
 
 
-@mcp.tool()
+@mcp.tool(title="Hämta høringsinnspill", annotations=LASNING_EXTERN)
 def nor_hamta_horinginnspill(
     horingid: str,
     med_fulltext: bool = True,
     max_tecken: int = 4000,
-) -> dict:
+) -> InnspillSvar:
     """
     Hämtar skriftliga innspill (remissvar) till en høring (utskottsutfrågning).
 
@@ -1300,7 +1459,13 @@ def nor_hamta_horinginnspill(
     innspill behövs, och därför kostar med_fulltext=True ingen extra tid.
     """
     try:
-        innspill = st.hamta_skriftlige_innspill(horingid)
+        try:
+            innspill = st.hamta_skriftlige_innspill(horingid)
+        except st.StortingetFel as exc:
+            # Källan svarar likadant för en høring utan godkända innspill
+            # och för ett okänt ID. Det första är vanligt (muntliga høringer),
+            # så svaret blir en tom lista med förklaring, inte ett fel.
+            return {"horingid": horingid, "antal": 0, "innspill": [], "notat": str(exc)}
 
         for item in innspill:
             hel_text = item.pop("fulltext_md", "") or ""
@@ -1326,12 +1491,11 @@ def nor_hamta_horinginnspill(
         return svar
 
     except Exception as exc:
-        log.error("nor_hamta_horinginnspill misslyckades (horingid=%s): %s", horingid, exc)
-        return {"fel": str(exc), "horingid": horingid}
+        raise _verktygsfel(exc, f"Hämtningen av innspill till høring {horingid}") from exc
 
 
-@mcp.tool()
-def nor_lista_emner() -> dict:
+@mcp.tool(title="Lista Stortingets ämnen", annotations=LASNING_EXTERN)
+def nor_lista_emner() -> EmnerSvar:
     """
     Hämtar Stortingets ämnesklassificering (ca 250 ämnen i 2-nivåhierarki).
 
@@ -1356,16 +1520,15 @@ def nor_lista_emner() -> dict:
             "undernivaa": undernivaa,
         }
     except Exception as exc:
-        log.error("nor_lista_emner misslyckades: %s", exc)
-        return {"fel": str(exc)}
+        raise _verktygsfel(exc, "Hämtningen av ämnen") from exc
 
 
-@mcp.tool()
+@mcp.tool(title="Semantisk sökning", annotations=LASNING_DB)
 def nor_sok_semantisk(
     fraga: str,
     kilde: str = "alla",
     max_treff: int = 10,
-) -> dict:
+) -> SemantiskSvar:
     """
     Semantisk sökning i norsk cached text med pgvector (cosinuslikhet).
 
@@ -1390,32 +1553,21 @@ def nor_sok_semantisk(
         from db import vektor_sok, _ar_postgres
 
         if not _ar_postgres():
-            return {
-                "fel":   "Semantisk sökning kräver PostgreSQL + pgvector.",
-                "fraga": fraga,
-                "treff": [],
-            }
+            raise ToolError(
+                "Semantisk sökning kräver PostgreSQL med pgvector; servern kör "
+                "mot SQLite. Använd nor_sok eller nor_sok_lovdata (fulltext)."
+            )
 
         # Query-expansion (valfritt)
         extra = expandera_fraga(fraga)
         sok_text = fraga + (", " + ", ".join(extra) if extra else "")
 
         modell = _hamta_embedding_modell()
-
-        import os as _os
-        log_path = _SCRIPT_DIR / "logs" / "embedding.log"
-        log_fd   = _os.open(str(log_path), _os.O_WRONLY | _os.O_APPEND | _os.O_CREAT)
-        save_fd1 = _os.dup(1)
-        try:
-            _os.dup2(log_fd, 1)
-            embedding = modell.encode(
-                sok_text,
-                normalize_embeddings=True,
-            ).tolist()
-        finally:
-            _os.dup2(save_fd1, 1)
-            _os.close(save_fd1)
-            _os.close(log_fd)
+        embedding = modell.encode(
+            sok_text,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).tolist()
 
         kilde_filter = None if kilde == "alla" else kilde
         treff = vektor_sok(embedding, kilde_filter=kilde_filter, max_treff=max_treff)
@@ -1465,76 +1617,15 @@ def nor_sok_semantisk(
         return svar
 
     except Exception as exc:
-        log.error("nor_sok_semantisk misslyckades: %s", exc)
-        return {"fel": str(exc), "fraga": fraga, "treff": []}
-
-
-# ── HTTP-autentisering ────────────────────────────────────────────────────────
-
-def _make_auth_app(asgi_app, api_key: str):
-    """
-    Wrappa en ASGI-app med enkel Bearer-token-autentisering.
-    Alla anrop utan korrekt Authorization-header avvisas med HTTP 401.
-    """
-    from starlette.applications import Starlette
-    from starlette.middleware import Middleware
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import PlainTextResponse
-    from starlette.routing import Mount
-
-    class ApiKeyMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            token = (
-                request.headers.get("Authorization", "")
-                .removeprefix("Bearer ")
-                .strip()
-            )
-            if token != api_key:
-                return PlainTextResponse(
-                    "Obehörig: ogiltig eller saknad API-nyckel.", status_code=401
-                )
-            return await call_next(request)
-
-    return Starlette(
-        routes=[Mount("/", app=asgi_app)],
-        middleware=[Middleware(ApiKeyMiddleware)],
-    )
+        raise _verktygsfel(exc, "Den semantiska sökningen") from exc
 
 
 # ── Startpunkt ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Initiera databas vid uppstart — fortsätter även om databasen inte är nåbar
-    try:
-        initiera_schema()
-    except Exception as _exc:
-        log.warning("Schemainitiering misslyckades — startar utan databas: %s", _exc)
-
-    if MCP_TRANSPORT == "http":
-        import uvicorn
-
-        try:
-            asgi_app = mcp.streamable_http_app()
-        except AttributeError:
-            log.warning(
-                "mcp.streamable_http_app() saknas — försöker med sse_app(). "
-                "Uppgradera mcp-paketet om problem uppstår."
-            )
-            asgi_app = mcp.sse_app()
-
-        if MCP_API_KEY:
-            log.info("API-nyckelautentisering aktiverad")
-            app = _make_auth_app(asgi_app, MCP_API_KEY)
-        else:
-            log.warning(
-                "MCP_API_KEY är inte satt — servern körs utan autentisering. "
-                "Bind enbart till loopback (MCP_HOST=127.0.0.1) eller "
-                "skydda via reverse proxy."
-            )
-            app = asgi_app
-
-        log.info("Startar HTTP-transport på %s:%s", MCP_HOST, MCP_PORT)
-        uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="info")
-    else:
-        log.info("Startar stdio-transport (lokal användning)")
-        mcp.run(transport="stdio")
+    starta(
+        mcp,
+        standardport=8003,
+        initiera=initiera_schema,
+        forvarm_http=_forvarm_http,
+    )
