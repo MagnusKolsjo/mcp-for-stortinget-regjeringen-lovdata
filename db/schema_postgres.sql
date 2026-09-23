@@ -3,6 +3,10 @@
 -- Databasschema: PostgreSQL + pgvector
 -- Kräver: CREATE EXTENSION vector; (pgvector installerat)
 --
+-- Bas-schema, låst sedan 1.0.0. Ändra aldrig blocken nedan: nya kolumner
+-- och index läggs som migrationer i db.py (_kor_migrationer), så att
+-- befintliga databaser uppdateras vid nästa start.
+--
 -- Tabellerna placeras i schemat norge för att undvika kollisioner med
 -- andra MCP-servrar som delar samma PostgreSQL-instans.
 -- =============================================================================

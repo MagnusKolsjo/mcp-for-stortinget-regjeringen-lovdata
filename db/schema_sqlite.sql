@@ -3,6 +3,10 @@
 -- Databasschema: SQLite (utan pgvector — semantisk sökning kräver PostgreSQL)
 --
 -- Använd vid SQLite-konfiguration. Semantisk sökning kräver PostgreSQL + pgvector.
+--
+-- Bas-schema, låst sedan 1.0.0. Ändra aldrig blocken nedan: nya kolumner
+-- och index läggs som migrationer i db.py (_kor_migrationer), så att
+-- befintliga databaser uppdateras vid nästa start.
 -- Aktivera FTS via: CREATE VIRTUAL TABLE nor_dokument_fts USING fts5(...)
 -- =============================================================================
 

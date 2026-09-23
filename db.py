@@ -20,12 +20,14 @@ egen anslutning. Detta gör koden tråd-säker, slipper stale-connection-
 problematik och håller transaktionerna korta.
 """
 
+import json
 import logging
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence, Union
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -61,8 +63,11 @@ def _hamta_db():
             ) from exc
         return psycopg2.connect(DATABASE_URL)
 
-    # SQLite — extrahera filsökväg från sqlite:/// eller sqlite:////absolut/sökväg
-    sokvag = urlparse(DATABASE_URL).path.lstrip("/")
+    # SQLite: sqlite:///relativ.db ger sökvägen '/relativ.db' och
+    # sqlite:////absolut/fil.db ger '//absolut/fil.db'. Bara det första
+    # snedstrecket hör till URL-syntaxen; resten är en del av sökvägen.
+    sokvag = urlparse(DATABASE_URL).path
+    sokvag = sokvag[1:] if sokvag.startswith("/") else sokvag
     if not sokvag:
         raise RuntimeError("DATABASE_URL för SQLite saknar filsökväg")
     conn = sqlite3.connect(sokvag, check_same_thread=False)
@@ -113,6 +118,7 @@ def initiera_schema():
                     cur.execute(sql)
             else:
                 conn.executescript(sql)
+            _kor_migrationer(conn)
             conn.commit()
             log.info("Schema initierat (%s)", "postgres" if _ar_postgres() else "sqlite")
         finally:
@@ -123,6 +129,37 @@ def initiera_schema():
             "Verktygsanrop felar tills databasen är tillgänglig.",
             exc,
         )
+
+
+def _kolumn_finns(conn, tabell: str, kolumn: str) -> bool:
+    """True om kolumnen finns (SQLite saknar ADD COLUMN IF NOT EXISTS)."""
+    return any(rad[1] == kolumn for rad in conn.execute(f"PRAGMA table_info({tabell})"))
+
+
+def _kor_migrationer(conn) -> None:
+    """
+    Schemaändringar efter första publicering, i kronologisk ordning.
+
+    Bas-schemat i db/schema_*.sql är låst sedan 1.0.0 och ändras aldrig;
+    befintliga installationer får nya kolumner och index härifrån. Varje
+    steg är idempotent och körs vid varje start. Stegen är ren DDL, så de
+    committas tillsammans med bas-schemat.
+    """
+    # Lovtidend avd. I: vilka författningar ett kungjort dokument ändrar
+    # (Lovdatas refid, blankstegsseparerade, t.ex. 'lov/1999-07-02-64') och
+    # ikraftträdandet som källan anger det — ofta fritext som 'Kongen
+    # bestemmer', som inte ryms i en DATE-kolumn.
+    nya_kolumner = (("endrer", "TEXT"), ("ikraft", "TEXT"))
+    if _ar_postgres():
+        with conn.cursor() as cur:
+            for kolumn, typ in nya_kolumner:
+                cur.execute(
+                    f"ALTER TABLE {_prefix()}dokument ADD COLUMN IF NOT EXISTS {kolumn} {typ}"
+                )
+    else:
+        for kolumn, typ in nya_kolumner:
+            if not _kolumn_finns(conn, "dokument", kolumn):
+                conn.execute(f"ALTER TABLE dokument ADD COLUMN {kolumn} {typ}")
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +197,7 @@ def _cursor():
 def fts_sok(
     fraga: str,
     kilde_filter: Optional[str] = None,
-    dok_type_filter: Optional[str] = None,
+    dok_type_filter: Optional[Union[str, Sequence[str]]] = None,
     max_treff: int = 10,
 ) -> list[dict]:
     """
@@ -174,8 +211,11 @@ def fts_sok(
     förekomma. AND-delen faller ut av plainto_tsquery, som själv kombinerar
     orden i en fras med &.
 
+    dok_type_filter är en dokumenttyp, en sekvens av typer eller None/'alla'
+    för alla typer.
+
     Returnerar lista med dicts: {dok_id, kilde, dok_type, beteckning, tittel,
-                                  dato, url, lovdata_id, rank}
+                                  dato, url, lovdata_id, endrer, ikraft, rank}
     """
     termer = [t.strip() for t in fraga.split(",") if t.strip()]
     if not termer:
@@ -195,9 +235,10 @@ def _pg_fts_sok(termer, kilde_filter, dok_type_filter, max_treff) -> list[dict]:
     if kilde_filter:
         villkor.append("kilde = %s")
         filter_params.append(kilde_filter)
-    if dok_type_filter and dok_type_filter != "alla":
-        villkor.append("dok_type = %s")
-        filter_params.append(dok_type_filter)
+    typer = _dok_typer(dok_type_filter)
+    if typer:
+        villkor.append(f"dok_type IN ({', '.join(['%s'] * len(typer))})")
+        filter_params.extend(typer)
 
     where_extra = ("AND " + " AND ".join(villkor)) if villkor else ""
     params = list(termer) + filter_params + [max_treff]
@@ -206,7 +247,7 @@ def _pg_fts_sok(termer, kilde_filter, dok_type_filter, max_treff) -> list[dict]:
         WITH q AS (SELECT {tsq_parts} AS tsq)
         SELECT
             d.id AS dok_id, d.kilde, d.dok_type, d.beteckning, d.tittel,
-            d.dato, d.url, d.lovdata_id,
+            d.dato, d.url, d.lovdata_id, d.endrer, d.ikraft,
             ts_rank_cd(
                 to_tsvector('norwegian',
                     coalesce(d.tittel,'') || ' ' || coalesce(d.fulltext_md,'')),
@@ -235,7 +276,9 @@ def _pg_fts_sok(termer, kilde_filter, dok_type_filter, max_treff) -> list[dict]:
             "dato":       str(r[5]) if r[5] else None,
             "url":        r[6],
             "lovdata_id": r[7],
-            "rank":       float(r[8]) if r[8] is not None else 0.0,
+            "endrer":     r[8].split() if r[8] else [],
+            "ikraft":     r[9],
+            "rank":       float(r[10]) if r[10] is not None else 0.0,
         }
         for r in rader
     ]
@@ -254,15 +297,16 @@ def _sq_fts_sok(termer, kilde_filter, dok_type_filter, max_treff) -> list[dict]:
     if kilde_filter:
         villkor.append("kilde = ?")
         params.append(kilde_filter)
-    if dok_type_filter and dok_type_filter != "alla":
-        villkor.append("dok_type = ?")
-        params.append(dok_type_filter)
+    typer = _dok_typer(dok_type_filter)
+    if typer:
+        villkor.append(f"dok_type IN ({', '.join(['?'] * len(typer))})")
+        params.extend(typer)
 
     params.append(max_treff)
 
     sql = f"""
         SELECT id AS dok_id, kilde, dok_type, beteckning, tittel,
-               dato, url, lovdata_id, 0.0 AS rank
+               dato, url, lovdata_id, endrer, ikraft, 0.0 AS rank
         FROM   dokument
         WHERE  {' AND '.join(villkor)}
         ORDER  BY dato DESC
@@ -283,7 +327,85 @@ def _sq_fts_sok(termer, kilde_filter, dok_type_filter, max_treff) -> list[dict]:
             "dato":       str(r[5]) if r[5] else None,
             "url":        r[6],
             "lovdata_id": r[7],
+            "endrer":     r[8].split() if r[8] else [],
+            "ikraft":     r[9],
             "rank":       0.0,
+        }
+        for r in rader
+    ]
+
+
+def _dok_typer(dok_type_filter) -> list[str]:
+    """Normaliserar dok_type-filtret till en lista; tom lista = inget filter."""
+    if not dok_type_filter or dok_type_filter == "alla":
+        return []
+    if isinstance(dok_type_filter, str):
+        return [dok_type_filter]
+    return list(dok_type_filter)
+
+
+# ---------------------------------------------------------------------------
+# Lovtidend — uppslag på ändrad författning
+# ---------------------------------------------------------------------------
+
+_REFID_MONSTER = re.compile(
+    r"^(?:(?:NL|SF|LTI)/)?(lov|forskrift)/(\d{4}-\d{2}-\d{2}-\d+)$", re.IGNORECASE
+)
+_BETECKNING_MONSTER = re.compile(r"^(LOV|FOR)-(\d{4}-\d{2}-\d{2}-\d+)$", re.IGNORECASE)
+
+
+def normalisera_refid(text: str) -> Optional[str]:
+    """
+    Gör om en författningsreferens till Lovdatas refid, t.ex.
+    'NL/lov/2005-06-17-62', 'LOV-2005-06-17-62' och 'lov/2005-06-17-62'
+    → 'lov/2005-06-17-62'. Returnerar None om texten inte är en sådan referens.
+    """
+    text = text.strip()
+    m = _REFID_MONSTER.match(text)
+    if m:
+        return f"{m.group(1).lower()}/{m.group(2)}"
+    m = _BETECKNING_MONSTER.match(text)
+    if m:
+        typ = "lov" if m.group(1).upper() == "LOV" else "forskrift"
+        return f"{typ}/{m.group(2)}"
+    return None
+
+
+def lovtidend_som_endrer(refid: str, max_treff: int = 10) -> list[dict]:
+    """
+    Lovtidend-dokument som enligt källans metadata ändrar författningen refid
+    (t.ex. 'lov/2005-06-17-62'), nyast kungjorda först.
+
+    Matchningen sker på hela refid, så 'lov/2005-06-17-6' träffar inte
+    'lov/2005-06-17-62'. Poster med paragrafsuffix ('lov/.../§21') räknas
+    som träff på författningen.
+    """
+    ph = _ph()
+    sql = f"""
+        SELECT id, kilde, dok_type, beteckning, tittel, dato, url,
+               lovdata_id, endrer, ikraft
+        FROM   {_prefix()}dokument
+        WHERE  kilde = {ph} AND dok_type = {ph}
+          AND  ((' ' || endrer || ' ') LIKE {ph} OR (' ' || endrer) LIKE {ph})
+        ORDER  BY dato DESC
+        LIMIT  {ph}
+    """
+    with _cursor() as cur:
+        cur.execute(sql, ("lovdata", "lovtidend", f"% {refid} %", f"% {refid}/%", max_treff))
+        rader = cur.fetchall()
+    return [
+        {
+            "dok_id":     r[0],
+            "kilde":      r[1],
+            "dok_type":   r[2],
+            "beteckning": r[3],
+            "tittel":     r[4],
+            "dato":       str(r[5]) if r[5] else None,
+            "url":        r[6],
+            "lovdata_id": r[7],
+            "endrer":     r[8].split() if r[8] else [],
+            "ikraft":     r[9],
+            "rank":       1.0,
         }
         for r in rader
     ]
@@ -305,74 +427,75 @@ def upsert_dokument(
     sakid: Optional[str],
     lovdata_id: Optional[str],
     fulltext_md: Optional[str],
+    endrer: Optional[str] = None,
+    ikraft: Optional[str] = None,
 ) -> int:
     """
     Infogar eller uppdaterar ett dokument. Returnerar postens id.
     Konflikt avgörs på (kilde, publikasjonid) eller (kilde, lovdata_id).
+
+    endrer och ikraft används av Lovtidend-dokument; se _kor_migrationer.
     """
+    # Konfliktkolumnen följer vilken naturlig nyckel dokumentet har.
+    # NULL-på-NULL är ingen konflikt, så ett dokument utan båda nycklarna
+    # infogas alltid.
+    konflikt = "lovdata_id" if (lovdata_id and not publikasjonid) else "publikasjonid"
+    varden = (kilde, dok_type, beteckning, tittel, sesjonid, dato, url,
+              publikasjonid, sakid, lovdata_id, fulltext_md, endrer, ikraft)
     if _ar_postgres():
-        return _pg_upsert_dokument(
-            kilde, dok_type, beteckning, tittel, sesjonid, dato,
-            url, publikasjonid, sakid, lovdata_id, fulltext_md
-        )
-    return _sq_upsert_dokument(
-        kilde, dok_type, beteckning, tittel, sesjonid, dato,
-        url, publikasjonid, sakid, lovdata_id, fulltext_md
-    )
+        return _pg_upsert_dokument(varden, konflikt)
+    return _sq_upsert_dokument(varden, konflikt, kilde, publikasjonid, lovdata_id)
 
 
-def _pg_upsert_dokument(kilde, dok_type, beteckning, tittel, sesjonid,
-                         dato, url, publikasjonid, sakid, lovdata_id, fulltext_md) -> int:
-    # Välj konfliktkolumn beroende på källa
-    if publikasjonid:
-        conflict_col = "publikasjonid"
-    elif lovdata_id:
-        conflict_col = "lovdata_id"
-    else:
-        conflict_col = "publikasjonid"  # NULL-på-NULL är inte en konflikt — insert alltid
+_UPSERT_KOLUMNER = (
+    "kilde, dok_type, beteckning, tittel, sesjonid, dato, url, "
+    "publikasjonid, sakid, lovdata_id, fulltext_md, endrer, ikraft"
+)
 
+
+def _pg_upsert_dokument(varden: tuple, konflikt: str) -> int:
     sql = f"""
-        INSERT INTO {_prefix()}dokument
-            (kilde, dok_type, beteckning, tittel, sesjonid, dato,
-             url, publikasjonid, sakid, lovdata_id, fulltext_md, cachad_vid)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-        ON CONFLICT (kilde, {conflict_col}) DO UPDATE SET
+        INSERT INTO {_prefix()}dokument ({_UPSERT_KOLUMNER}, cachad_vid)
+        VALUES ({', '.join(['%s'] * len(varden))}, NOW())
+        ON CONFLICT (kilde, {konflikt}) DO UPDATE SET
             tittel       = EXCLUDED.tittel,
             fulltext_md  = EXCLUDED.fulltext_md,
+            endrer       = EXCLUDED.endrer,
+            ikraft       = EXCLUDED.ikraft,
             cachad_vid   = NOW()
         RETURNING id
     """
     with _cursor() as cur:
-        cur.execute(sql, (kilde, dok_type, beteckning, tittel, sesjonid, dato,
-                          url, publikasjonid, sakid, lovdata_id, fulltext_md))
+        cur.execute(sql, varden)
         row = cur.fetchone()
     return row[0]
 
 
-def _sq_upsert_dokument(kilde, dok_type, beteckning, tittel, sesjonid,
-                         dato, url, publikasjonid, sakid, lovdata_id, fulltext_md) -> int:
-    sql_insert = """
-        INSERT INTO dokument
-            (kilde, dok_type, beteckning, tittel, sesjonid, dato,
-             url, publikasjonid, sakid, lovdata_id, fulltext_md)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (kilde, publikasjonid) DO UPDATE SET
+def _sq_upsert_dokument(varden: tuple, konflikt: str, kilde, publikasjonid, lovdata_id) -> int:
+    # Konfliktkolumnen måste vara samma unika nyckel som krockar. Med
+    # (kilde, publikasjonid) även för Lovdata-dokument, som bara har
+    # lovdata_id, avvisades varje omsynk med "UNIQUE constraint failed".
+    sql_insert = f"""
+        INSERT INTO dokument ({_UPSERT_KOLUMNER})
+        VALUES ({', '.join(['?'] * len(varden))})
+        ON CONFLICT (kilde, {konflikt}) DO UPDATE SET
             tittel      = excluded.tittel,
             fulltext_md = excluded.fulltext_md,
+            endrer      = excluded.endrer,
+            ikraft      = excluded.ikraft,
             cachad_vid  = datetime('now')
     """
+    nyckel = lovdata_id if konflikt == "lovdata_id" else publikasjonid
     with _cursor() as cur:
-        cur.execute(sql_insert, (kilde, dok_type, beteckning, tittel, sesjonid, dato,
-                                  url, publikasjonid, sakid, lovdata_id, fulltext_md))
-        if cur.lastrowid:
-            return cur.lastrowid
-        # Hämta befintligt id vid konflikt
+        cur.execute(sql_insert, varden)
         cur.execute(
-            "SELECT id FROM dokument WHERE kilde=? AND publikasjonid=?",
-            (kilde, publikasjonid)
+            f"SELECT id FROM dokument WHERE kilde=? AND {konflikt}=?",
+            (kilde, nyckel),
         )
         row = cur.fetchone()
-    return row["id"] if row else -1
+        if row:
+            return row["id"]
+        return cur.lastrowid or -1
 
 
 # ---------------------------------------------------------------------------
@@ -395,12 +518,19 @@ def get_sync_status(kilde: str) -> dict:
     with _cursor() as cur:
         cur.execute(sql, (kilde,))
         row = cur.fetchone()
-    return dict(row) if row else {}
+    if not row:
+        return {}
+    status = dict(row)
+    # SQLite lagrar detaljer som JSON-text; Postgres ger redan en dict (JSONB).
+    try:
+        status["detaljer"] = json.loads(status["detaljer"]) if status["detaljer"] else {}
+    except (TypeError, ValueError):
+        status["detaljer"] = {}
+    return status
 
 
 def set_sync_status(kilde: str, checksum: Optional[str] = None, detaljer: Optional[str] = None):
     """Uppdaterar (eller infogar) synk-status för en källa."""
-    import json
     if isinstance(detaljer, dict):
         detaljer = json.dumps(detaljer)
 
