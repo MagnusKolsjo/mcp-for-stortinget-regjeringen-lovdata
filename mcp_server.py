@@ -112,9 +112,23 @@ mcp = FastMCP(
         "nor_lista_publikasjoner ger vägen från en sökträff till sakens dokument. "
         "nor_hamta_vedtak ger parlamentariska beslutstexter. "
         "nor_hamta_horinginnspill ger skriftliga remissvar till høringer. "
-        "nor_lista_emner ger Stortingets ämnesklassificering."
+        "nor_lista_emner ger Stortingets ämnesklassificering. "
+        "LOVTIDEND: Norsk Lovtidend avd. I (2001–idag) innehåller lagar och "
+        "sentrala forskrifter i den form de kungjordes — främst ändringslagar "
+        "och ändringsforskrifter. Använd den för att se vilken ändringslag som "
+        "ändrade vad och när: nor_sok_lovdata(fraga='LOV-2005-06-17-62', "
+        "dok_type='lovtidend') listar de kungjorda dokument som ändrar "
+        "arbetsmiljölagen, nyast först, med kungörandedatum (dato), "
+        "ikraftträdande (ikraft) och ändrade författningar (endrer). Läs "
+        "ändringstexten med nor_hamta_lovdokument(lovdata_id='LTI/lov/...'). "
+        "Den gällande, konsoliderade texten söks som förut med dok_type 'lov', "
+        "'forskrift' eller 'alla'."
     ),
 )
+
+# En lag har samma beteckning (LOV-...) i gällande form och i Lovtidend. Vid
+# uppslag på beteckning eller titel ska den gällande texten komma först.
+_LOVTIDEND_SIST = "CASE WHEN dok_type = 'lovtidend' THEN 1 ELSE 0 END"
 
 # Cachad sessionsrespons (hämtas vid behov, återanvänds)
 _sesjoner_cache: Optional[dict] = None
@@ -621,6 +635,11 @@ def nor_lista_publikasjoner(sakid: str) -> dict:
         return {"fel": str(exc), "sakid": sakid}
 
 
+# Gällande rätt. 'alla' i nor_sok_lovdata och Lovdata-delen av nor_sok avser
+# de konsoliderade texterna; Lovtidend söks uttryckligen med dok_type.
+_GJELDENDE_TYPER = ("lov", "forskrift")
+
+
 @mcp.tool()
 def nor_sok_lovdata(
     fraga: str,
@@ -628,37 +647,67 @@ def nor_sok_lovdata(
     max_treff: int = 10,
 ) -> dict:
     """
-    Söker i den lokala Lovdata-cachen (gällande norska lagar och forskrifter).
+    Söker i den lokala Lovdata-cachen: gällande norska lagar och forskrifter,
+    och Norsk Lovtidend avd. I.
 
     Parametrar:
       fraga     — Sökfråga. Komma separerar termer och ger OR mellan dem;
                   flera ord inom en term ger AND — alla orden måste förekomma.
                   Exempel: "arbeidsmiljø, oppsigelse" söker endera termen.
-      dok_type  — Filtrera på dokumenttyp: 'lov', 'forskrift' eller 'alla'.
-                  Standard: alla.
+                  Med dok_type='lovtidend' kan en term också vara en
+                  författningsreferens ('LOV-2005-06-17-62',
+                  'NL/lov/2005-06-17-62', 'lov/2005-06-17-62'); då listas de
+                  kungjorda dokument som ändrar den författningen, nyast först.
+      dok_type  — 'lov', 'forskrift', 'alla' (gällande lagar och forskrifter,
+                  standard) eller 'lovtidend' (Norsk Lovtidend avd. I:
+                  lagar och sentrala forskrifter i den form de kungjordes
+                  2001 och framåt, mest ändringslagar och ändringsforskrifter).
       max_treff — Max antal träffar (standard 10).
 
     Returnerar:
       En lista med matchande dokument (lovdata_id, beteckning, tittel,
-      korttittel, dato, url) sorterade efter relevans.
+      dok_type, dato, url) sorterade efter relevans. Lovtidend-träffar bär
+      också endrer (refid för de ändrade författningarna) och ikraft
+      (ikraftträdandet som källan anger det); dato är kungörandedatum.
 
     OBS: Cachen uppdateras via lovdata_sync.py (daglig synk). Om cachen är
     tom returneras ett tomt resultat — kör synkskriptet först.
     Sökningen är fulltextsökning i tittel + fulltext_md.
     """
     try:
-        from db import fts_sok
+        from db import fts_sok, lovtidend_som_endrer, normalisera_refid
 
-        typ_filter = dok_type if dok_type in ("lov", "forskrift") else None
-        rader = fts_sok(
-            fraga,
-            kilde_filter    = "lovdata",
-            dok_type_filter = typ_filter,
-            max_treff       = max_treff,
-        )
+        if dok_type in ("lov", "forskrift", "lovtidend"):
+            typ_filter = dok_type
+        else:
+            typ_filter = _GJELDENDE_TYPER
 
-        treff = [
-            {
+        rader: list[dict] = []
+        fritext = fraga
+        if dok_type == "lovtidend":
+            termer = [t.strip() for t in fraga.split(",") if t.strip()]
+            refider = [r for r in (normalisera_refid(t) for t in termer) if r]
+            for refid in refider:
+                for rad in lovtidend_som_endrer(refid, max_treff):
+                    rad["matchade_termer"] = [refid]
+                    rader.append(rad)
+            fritext = ", ".join(t for t in termer if not normalisera_refid(t))
+
+        if fritext.strip():
+            sedda = {r["lovdata_id"] for r in rader}
+            rader += [
+                r for r in fts_sok(
+                    fritext,
+                    kilde_filter    = "lovdata",
+                    dok_type_filter = typ_filter,
+                    max_treff       = max_treff,
+                )
+                if r["lovdata_id"] not in sedda
+            ]
+
+        treff = []
+        for r in rader[:max_treff]:
+            post = {
                 "lovdata_id": r["lovdata_id"],
                 "beteckning": r["beteckning"],
                 "tittel":     r["tittel"],
@@ -667,8 +716,12 @@ def nor_sok_lovdata(
                 "url":        r["url"],
                 "rank":       r["rank"],
             }
-            for r in rader
-        ]
+            if r["dok_type"] == "lovtidend":
+                post["endrer"] = r.get("endrer") or []
+                post["ikraft"] = r.get("ikraft")
+            if r.get("matchade_termer"):
+                post["matchade_termer"] = r["matchade_termer"]
+            treff.append(post)
 
         return {
             "fraga": fraga,
@@ -692,7 +745,9 @@ def nor_hamta_lovdokument(
 
     Parametrar:
       lovdata_id  — Lovdatas dokumentidentifierare, t.ex. 'NL/lov/2005-05-20-28'
-                    eller beteckning 'LOV-2005-05-20-28'.
+                    eller beteckning 'LOV-2005-05-20-28'. En beteckning ger
+                    den gällande texten; den kungjorda versionen i Lovtidend
+                    hämtas med sitt id, t.ex. 'LTI/lov/2026-01-23-1'.
       max_tecken  — Teckentak för fulltext_md (0 = ingen trunkering).
                     Rekommenderat för stora dokument — föreskrifter kan vara
                     100 000+ tecken. Exempel: max_tecken=20000 för en inledande
@@ -716,10 +771,12 @@ def nor_hamta_lovdokument(
         with _cursor() as cur:
             cur.execute(
                 f"""
-                SELECT lovdata_id, beteckning, tittel, dok_type, dato, url, fulltext_md
+                SELECT lovdata_id, beteckning, tittel, dok_type, dato, url, fulltext_md,
+                       endrer, ikraft
                 FROM   {_prefix()}dokument
                 WHERE  kilde = {_ph()}
                   AND  (lovdata_id = {_ph()} OR beteckning = {_ph()})
+                ORDER BY {_LOVTIDEND_SIST}
                 LIMIT 1
                 """,
                 ("lovdata", lovdata_id, lovdata_id)
@@ -747,6 +804,8 @@ def nor_hamta_lovdokument(
             "tecken_visade":        utdrag["tecken_visade"],
             "trunkerad":            utdrag["trunkerad"],
             "fortsatt_fran_tecken": utdrag["fortsatt_fran_tecken"],
+            **({"endrer": (rad[7] or "").split(), "ikraft": rad[8]}
+               if rad[3] == "lovtidend" else {}),
         }
 
     except Exception as exc:
@@ -774,8 +833,11 @@ def nor_sok(
 
     Returnerar:
       stortinget  — Saker från Stortingets live-API
-      lovdata     — Matchande lagar och forskrifter från lokal cache
+      lovdata     — Matchande gällande lagar och forskrifter från lokal cache
       regjeringen — Proposisjoner och NOU från lokal cache
+
+    Norsk Lovtidend ingår inte här; sök den med
+    nor_sok_lovdata(dok_type='lovtidend').
     """
     try:
         from db import fts_sok
@@ -801,8 +863,9 @@ def nor_sok(
         try:
             lovdata_treff = fts_sok(
                 fraga,
-                kilde_filter = "lovdata",
-                max_treff    = max_treff,
+                kilde_filter    = "lovdata",
+                dok_type_filter = _GJELDENDE_TYPER,
+                max_treff       = max_treff,
             )
             resultat["lovdata"] = {
                 "treff": lovdata_treff,
@@ -883,6 +946,7 @@ def nor_sok_i_dokument(
                    OR  publikasjonid = {_ph()}
                    OR  tittel     LIKE {_ph()}
                 ORDER BY (fulltext_md IS NOT NULL) DESC,
+                         {_LOVTIDEND_SIST},
                          length(coalesce(fulltext_md, '')) DESC
                 LIMIT 1
                 """,

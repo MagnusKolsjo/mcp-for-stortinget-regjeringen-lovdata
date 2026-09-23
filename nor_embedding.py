@@ -18,6 +18,7 @@ Användning:
     python3 nor_embedding.py --kilde lovdata
     python3 nor_embedding.py --kilde stortinget --tvinga
     python3 nor_embedding.py --kilde alla --batch 50
+    python3 nor_embedding.py --kilde lovtidend     # Lovtidend ingår inte i 'alla'
 """
 
 import argparse
@@ -206,10 +207,17 @@ def _hamta_dokument_utan_chunks(kilde: str | None, tvinga: bool) -> list[dict]:
         """
         params = ()
 
-    kilde_villkor = ""
-    if kilde and kilde != "alla":
-        kilde_villkor = "AND d.kilde = %s"
+    # Lovtidend (~40 000 kungjorda dokument, mest ändringstexter) embeddas
+    # bara på uttrycklig begäran: det skulle flerdubbla vektorindexet och ta
+    # timmar, och ändringstexterna nås bättre med fulltextsökning och
+    # uppslaget på ändrad författning i nor_sok_lovdata.
+    if kilde == "lovtidend":
+        kilde_villkor = "AND d.dok_type = 'lovtidend'"
+    elif kilde and kilde != "alla":
+        kilde_villkor = "AND d.kilde = %s AND d.dok_type IS DISTINCT FROM 'lovtidend'"
         params = (kilde,)
+    else:
+        kilde_villkor = "AND d.dok_type IS DISTINCT FROM 'lovtidend'"
 
     with _cursor() as cur:
         cur.execute(
@@ -412,8 +420,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--kilde",
         default="alla",
-        choices=["alla", "lovdata", "stortinget", "regjeringen.no"],
-        help="Källfilter (standard: alla)",
+        choices=["alla", "lovdata", "stortinget", "regjeringen.no", "lovtidend"],
+        help="Källfilter (standard: alla utom Lovtidend, som bara embeddas med --kilde lovtidend)",
     )
     parser.add_argument(
         "--tvinga",
