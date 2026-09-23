@@ -6,6 +6,77 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ---
 
+## [Unreleased]
+
+### Ändrat
+
+- **Brytande:** servern kräver MCP Python SDK 2.x (`mcp>=2.0,<3`) och bygger
+  på `MCPServer`. Verktygsnamn och parametrar är oförändrade.
+- **Brytande:** http-läget kräver `MCP_API_KEY`. Utan nyckel avbryts
+  uppstarten (exitkod 2) i stället för att servern startar oskyddad. Fel
+  nyckel ger HTTP 403, saknad header HTTP 401.
+- **Brytande:** förväntade fel returneras som verktygsfel (`isError`) med ett
+  förklarande meddelande, i stället för ett lyckat svar med fältet `fel`.
+  Det gäller bland annat okänd sak, okänt dokument i cachen, okänt vedtak,
+  saknad fulltext, semantisk sökning utan PostgreSQL och regjeringen.no:s
+  botskydd. Delresultat behåller `fel` per källa eller dokument (`nor_sok`,
+  enskilda publikationer i `nor_hamta_dokument`).
+- Alla verktyg har titel, annotationer (läsning mot källan eller mot den
+  lokala databasen) och typade svar med utdataschema.
+- Stortingets anropstakt är som standard 90 anrop/minut
+  (`STORTINGET_RATE_LIMIT`), och tokenhinken är begränsad så att taket på
+  100 anrop per rullande minut hålls även efter en vilopaus.
+- `nor_hamta_vedtak`: listan bär id, nummer, sak_id, dato, tittel och
+  vedtakstype; länkar, typnamn och full beslutstext finns i uppslaget på
+  `vedtakid`. `med_fulltext` ger beslutstexter upp till ett samlat
+  teckentak, och vedtak utöver taket markeras med `fulltext_utelamnad`.
+- `nor_hamta_horinginnspill` svarar med en tom lista och en förklaring när
+  Stortinget saknar godkända skriftliga innspill.
+- Lovdata-synken hoppar över ett paket vars `lastModified` i Lovdatas lista
+  inte ändrats sedan förra synken, utan att ladda ned det.
+- `nor_embedding.py` embeddar Lovtidend bara med `--kilde lovtidend`.
+
+### Tillagt
+
+- **Norsk Lovtidend avd. I** (2001–) som dokumenttyp `lovtidend` i
+  Lovdata-cachen, synkad från `lovtidend-avd1-<år1>-<år2>` och
+  `lovtidend-avd1-<innevarande år>`. Paketen väljs ur Lovdatas lista, så
+  årspaketet byts vid årsskiftet utan kodändring.
+- `nor_sok_lovdata(dok_type='lovtidend')`. En författningsreferens som term
+  (`LOV-2005-06-17-62`, `NL/lov/2005-06-17-62`) listar de kungjorda dokument
+  som ändrar författningen, nyast först, med `endrer` och `ikraft`.
+- Kolumnerna `endrer` och `ikraft` i `dokument`, tillagda som migrationer
+  ovanpå det låsta bas-schemat.
+- HTTP 429 från Stortinget hanteras: `Retry-After` (sekunder eller
+  HTTP-datum) respekteras och anropet görs om högst tre gånger.
+- Stortinget-anropen bär projektets User-Agent.
+
+### Fixat
+
+- **`nor_hamta_vedtak(vedtakid=...)` var en dold bulkhämtning.** Stortinget
+  har ingen endpoint för ett enskilt vedtak och ignorerar `vedtakid`, så
+  anropet hämtade innevarande sessions samtliga vedtak (över 7 MB) och
+  `med_fulltext=True` gjorde det en gång per vedtak. Vedtaket slås nu upp i
+  sessionens lista, som hålls i minnet en kort stund.
+- `nor_hamta_vedtak` läste fel fältnamn, så nummer, datum och beslutstext
+  alltid var tomma.
+- Tokenhinken mot Stortinget startade full och kunde släppa igenom närmare
+  200 anrop under första minuten; den var inte heller trådsäker.
+- Lovdatas paketlista lästes med fel nycklar och var därför alltid tom.
+- SQLite: omsynk av Lovdata-dokument avvisades med UNIQUE-fel, och
+  `sqlite:////absolut/sökväg` tolkades som relativ sökväg.
+- Embeddingmodellen och sessionslistan laddas lat bakom lås, eftersom
+  verktygen körs på arbetstrådar.
+
+### Borttaget
+
+- SSE-transporten och den egna Starlette-appen för autentisering; http-
+  läget är Streamable HTTP via `mcp_transport.py`.
+- Omdirigeringen av fildeskriptor 1 kring embeddingmodellen; SDK:n skyddar
+  stdio-protokollet själv.
+
+---
+
 ## [1.1.0] — 2026-08-10
 
 ### Tillagt

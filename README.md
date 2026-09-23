@@ -5,7 +5,7 @@ MCP-server (Model Context Protocol) som ger AI-verktyg tillgång till norsk parl
 Verktygen har prefixet `nor_` och täcker:
 
 - **Stortinget** — saker, spørsmål, høringer, vedtak och remissvar (1986-87 och framåt)
-- **Lovdata** — gällande norska lagar och forskrifter (lokal cache, daglig synk)
+- **Lovdata** — gällande norska lagar och forskrifter, och Norsk Lovtidend avd. I (lokal cache, daglig synk)
 - **regjeringen.no** — proposisjoner, stortingsmeldinger och NOU som Markdown (PDF-extraktion med OCR-fallback)
 
 Sökning stöder fulltextsökning (alla datakällor) och semantisk sökning med pgvector (kräver PostgreSQL + NbAiLab/nb-sbert-base).
@@ -18,6 +18,7 @@ Sökning stöder fulltextsökning (alla datakällor) och semantisk sökning med 
 |---|---|---|
 | data.stortinget.no | Saker, spørsmål, høringer, vedtak, innspill (XML + metadata) | Live-API |
 | Lovdata bulk | Gällande lagar och forskrifter | Daglig synk |
+| Lovdata bulk | Norsk Lovtidend avd. I (kungjorda lagar och sentrala forskrifter, 2001–) | Daglig synk; paket som inte ändrats hoppas över |
 | regjeringen.no | Proposisjoner, NOU, Meld. St. (PDF → Markdown) | Vid anrop / DB-cache |
 
 ---
@@ -25,6 +26,7 @@ Sökning stöder fulltextsökning (alla datakällor) och semantisk sökning med 
 ## Krav
 
 - Python 3.11+
+- MCP Python SDK 2.x (`mcp>=2.0,<3`)
 - PostgreSQL (rekommenderat) eller SQLite
 - Vid PostgreSQL: pgvector-tillägget för semantisk sökning
 - Delade beroenden installeras i gemensam `.venv` (se installationssteget nedan)
@@ -47,10 +49,11 @@ cp config.example.env .env
 
 Redigera `.env` och fyll i databasuppgifter och övriga inställningar.
 
-Initiera databasschemat:
+Databasschemat skapas, och befintliga databaser uppdateras, automatiskt
+när servern eller synkskriptet startar. Det går också att köra separat:
 
 ```
-python3 mcp_server.py --initiera
+python3 -c "import db; db.initiera_schema()"
 ```
 
 Kör den första synken av Lovdata-cachen:
@@ -59,12 +62,19 @@ Kör den första synken av Lovdata-cachen:
 bash synk_daglig.sh
 ```
 
+Första synken laddar ned Lovtidend-paketet för tidigare år (~70 MB) och
+läser in omkring 40 000 dokument; det tar en stund. Därefter hämtas det
+bara när Lovdata har ändrat det.
+
 Generera embeddings för semantisk sökning (kräver PostgreSQL + pgvector):
 
 ```
 python3 nor_embedding.py
 python3 nor_embedding.py --bygg-index
 ```
+
+Lovtidend embeddas bara på uttrycklig begäran (`--kilde lovtidend`); den
+nås annars med fulltextsökning och uppslag på ändrad författning.
 
 ---
 
@@ -84,7 +94,12 @@ Lägg till följande i Claude Desktops MCP-konfiguration (`claude_desktop_config
 }
 ```
 
-Använd `MCP_TRANSPORT=http` i `.env` för hostad driftsättning (lyssnar på `MCP_HOST:MCP_PORT`, standard `127.0.0.1:8003`).
+### http-transport
+
+Sätt `MCP_TRANSPORT=http` och `MCP_API_KEY` i `.env` för delad drift. Servern
+talar Streamable HTTP på `http://MCP_HOST:MCP_PORT/mcp` (standard
+`127.0.0.1:8003`) och kräver `Authorization: Bearer <MCP_API_KEY>` på alla
+anrop. Utan `MCP_API_KEY` startar servern inte i http-läge. SSE stöds inte.
 
 ---
 
@@ -106,7 +121,7 @@ bash synk_daglig.sh --installera-schema
 |---|---|
 | `nor_sok` | Samlad sökning över alla källor: Stortinget (live), Lovdata och regjeringen.no (cache) |
 | `nor_sok_stortinget` | Söker saker, spørsmål och høringer i Stortinget för en given session |
-| `nor_sok_lovdata` | Söker i lokal Lovdata-cache (lagar och forskrifter) |
+| `nor_sok_lovdata` | Söker i lokal Lovdata-cache: gällande lagar och forskrifter, eller Lovtidend (`dok_type='lovtidend'`) |
 | `nor_sok_i_dokument` | Sökning inom ett specifikt cachat dokument, avsnitt för avsnitt — alla källor |
 | `nor_sok_semantisk` | Semantisk sökning med pgvector (kräver PostgreSQL + embeddings) |
 
@@ -124,9 +139,28 @@ bash synk_daglig.sh --installera-schema
 | Verktyg | Beskrivning |
 |---|---|
 | `nor_lista_sesjoner` | Listar alla Stortingssesjoner (43 st, 1986-87 och framåt) |
-| `nor_hamta_vedtak` | Hämtar stortingsvedtak (parlamentariska beslut) för en session eller ett specifikt vedtak |
+| `nor_hamta_vedtak` | Hämtar stortingsvedtak (parlamentariska beslut) för en session, eller ett enskilt vedtak ur en session |
 | `nor_hamta_horinginnspill` | Hämtar skriftliga innspill (remissvar) till en høring, med fulltext |
 | `nor_lista_emner` | Hämtar Stortingets ämnesklassificering (ca 250 ämnen i 2-nivåhierarki) |
+
+---
+
+## Norsk Lovtidend — vilken ändringslag ändrade vad och när
+
+Lovtidend avd. I innehåller lagar och sentrala forskrifter i den form de
+kungjordes, främst ändringslagar och ändringsforskrifter. Varje dokument bär
+vilka författningar det ändrar (`endrer`), när det kungjordes (`dato`) och
+när det träder i kraft (`ikraft`, ofta fritext som "Kongen bestemmer").
+
+```
+nor_sok_lovdata(fraga="LOV-2005-06-17-62", dok_type="lovtidend")
+   → kungjorda dokument som ändrar arbeidsmiljøloven, nyast först
+nor_hamta_lovdokument(lovdata_id="LTI/lov/2026-01-23-1")
+   → ändringstexten
+```
+
+Övriga termer söks med fulltext bland Lovtidend-dokumenten. `dok_type='alla'`
+avser som tidigare den gällande, konsoliderade texten.
 
 ---
 
@@ -178,6 +212,20 @@ nor_hamta_regjeringen(url=<regjeringen_url>)       → proposisjonen
 
 Proposisjoner och stortingsmeldinger distribueras inte av Stortingets API. URL:en
 till regjeringen.no finns i sakens fält `regjeringen_url`.
+
+---
+
+## Felhantering
+
+Förväntade fel — okänd identifierare, dokument som saknas i cachen, källor
+som inte svarar eller blockerar automatiserad åtkomst — returneras som
+verktygsfel (`isError`) med ett meddelande som säger vad som gick fel och
+vad man kan göra i stället. regjeringen.no ligger bakom en Cloudflare-
+utmaning som servern känner igen och förklarar, men inte försöker passera.
+
+Stortingets tak är 100 anrop per minut. Klienten håller sig till 90 per
+minut (`STORTINGET_RATE_LIMIT`) och respekterar `Retry-After` om källan
+ändå svarar HTTP 429.
 
 ---
 
