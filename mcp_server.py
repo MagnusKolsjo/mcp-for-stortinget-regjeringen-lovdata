@@ -133,7 +133,8 @@ mcp = MCPServer(
         "ikraftträdande (ikraft) och ändrade författningar (endrer). Läs "
         "ändringstexten med nor_hamta_lovdokument(lovdata_id='LTI/lov/...'). "
         "Den gällande, konsoliderade texten söks som förut med dok_type 'lov', "
-        "'forskrift' eller 'alla'."
+        "'forskrift' eller 'alla'. nor_sok_semantisk söker som standard utanför "
+        "Lovtidend; dok_type='lovtidend' eller 'alla_med_lovtidend' tar med den."
     ),
 )
 
@@ -391,6 +392,7 @@ class SokIDokumentSvar(TypedDict):
     beteckning: str | None
     tittel: str
     kilde: str | None
+    dok_type: str | None
     publikasjonid: str | None
     url: str | None
     fraga: str
@@ -441,6 +443,7 @@ class SemantiskSvar(TypedDict):
     fraga: str
     expansion: list[str]
     kilde: str
+    dok_type: str
     antal: int
     treff: list[Post]
     diagnostik: NotRequired[Post]
@@ -1108,7 +1111,11 @@ def nor_sok_i_dokument(
     """
     Söker inom ett specifikt cachat dokument och returnerar matchande avsnitt.
 
-    Söker i alla cachade källor — Lovdata, Stortinget och regjeringen.no.
+    Söker i alla cachade källor — Lovdata (gällande texter och Lovtidend),
+    Stortinget och regjeringen.no. Svaret visar dokumentets dok_type. En
+    beteckning eller titeldel som finns både som gällande text och i
+    Lovtidend ger den gällande texten; Lovtidend-versionen nås med sitt
+    LTI-id.
 
     Parametrar:
       lovdata_id — Dokumentets identifierare. Godtar Lovdata-id
@@ -1141,7 +1148,7 @@ def nor_sok_i_dokument(
             cur.execute(
                 f"""
                 SELECT lovdata_id, beteckning, tittel, fulltext_md, kilde,
-                       publikasjonid, url
+                       publikasjonid, url, dok_type
                 FROM   {_prefix()}dokument
                 WHERE  lovdata_id    = {_ph()}
                    OR  beteckning    = {_ph()}
@@ -1165,7 +1172,7 @@ def nor_sok_i_dokument(
                 "dagliga synken."
             )
 
-        dok_id, beteckning, dok_tittel, fulltext, kilde, pub_id, url = rad
+        dok_id, beteckning, dok_tittel, fulltext, kilde, pub_id, url, dok_typ = rad
         fulltext   = fulltext or ""
         dok_tittel = dok_tittel or ""
 
@@ -1216,6 +1223,7 @@ def nor_sok_i_dokument(
             "beteckning":    beteckning,
             "tittel":        dok_tittel,
             "kilde":         kilde,
+            "dok_type":      dok_typ,
             "publikasjonid": pub_id,
             "url":           url,
             "fraga":         fraga,
@@ -1593,6 +1601,7 @@ def nor_sok_semantisk(
     fraga: str,
     kilde: str = "alla",
     max_treff: int = 10,
+    dok_type: str = "alla",
 ) -> SemantiskSvar:
     """
     Semantisk sökning i norsk cached text med pgvector (cosinuslikhet).
@@ -1609,10 +1618,16 @@ def nor_sok_semantisk(
       kilde   — Begränsa till datakälla: 'lovdata', 'stortinget',
                 'regjeringen.no' eller 'alla' (standard).
       max_treff — Max antal träffar (standard 10).
+      dok_type — Begränsa till dokumenttyp. 'alla' (standard) söker i allt
+                utom Norsk Lovtidend, så att ändringslagar inte tränger undan
+                gällande rätt och Stortingets dokument. 'lovtidend' söker
+                bara i Lovtidend, 'alla_med_lovtidend' i allt. Andra värden
+                matchar dok_type exakt, t.ex. 'lov', 'forskrift',
+                'innstilling_ny', 'proposisjon'.
 
     Returnerar:
       Lista med matchande textstycken (rubrik, text, likhet 0–1,
-      källdokumentets metadata).
+      källdokumentets metadata inklusive dok_type).
     """
     try:
         from db import vektor_sok, _ar_postgres
@@ -1635,12 +1650,21 @@ def nor_sok_semantisk(
         ).tolist()
 
         kilde_filter = None if kilde == "alla" else kilde
-        treff = vektor_sok(embedding, kilde_filter=kilde_filter, max_treff=max_treff)
+        if dok_type == "alla":
+            typfilter = {"utom_dok_typer": ["lovtidend"]}
+        elif dok_type == "alla_med_lovtidend":
+            typfilter = {}
+        else:
+            typfilter = {"dok_typer": [dok_type]}
+        treff = vektor_sok(
+            embedding, kilde_filter=kilde_filter, max_treff=max_treff, **typfilter
+        )
 
         svar = {
             "fraga":     fraga,
             "expansion": extra,
             "kilde":     kilde,
+            "dok_type":  dok_type,
             "antal":     len(treff),
             "treff":     treff,
         }

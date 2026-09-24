@@ -589,9 +589,14 @@ def vektor_sok(
     embedding: list[float],
     kilde_filter: Optional[str] = None,
     max_treff: int = 10,
+    dok_typer: Optional[Sequence[str]] = None,
+    utom_dok_typer: Optional[Sequence[str]] = None,
 ) -> list[dict]:
     """
     Semantisk sökning i norge.chunks med pgvector (cosinuslikhet).
+
+    dok_typer begränsar till de angivna dokumenttyperna; utom_dok_typer
+    utesluter typer (dokument utan typ räknas inte som uteslutna).
 
     Kräver PostgreSQL — returnerar tom lista vid SQLite eller om pgvector saknas.
 
@@ -610,6 +615,14 @@ def vektor_sok(
     if kilde_filter:
         villkor.append("d.kilde = %s")
         filter_params.append(kilde_filter)
+    if dok_typer:
+        villkor.append(f"d.dok_type IN ({', '.join(['%s'] * len(dok_typer))})")
+        filter_params.extend(dok_typer)
+    if utom_dok_typer:
+        villkor.append(
+            f"(d.dok_type IS NULL OR d.dok_type NOT IN ({', '.join(['%s'] * len(utom_dok_typer))}))"
+        )
+        filter_params.extend(utom_dok_typer)
 
     where_extra = ("AND " + " AND ".join(villkor)) if villkor else ""
     params = [vec_str] + filter_params + [vec_str, max_treff]
@@ -637,8 +650,20 @@ def vektor_sok(
 
     try:
         with _cursor() as cur:
+            if villkor:
+                # IVFFlat-indexet letar i ett fåtal listor och filtrerar
+                # efteråt. När filtret utesluter de flesta chunks (Lovtidend
+                # står för merparten) blir det då för få träffar. Iterativ
+                # skanning (pgvector 0.8+) fortsätter tills LIMIT är fylld;
+                # ordningen kan bli ungefärlig och sorteras därför om nedan.
+                cur.execute("SAVEPOINT iterativ")
+                try:
+                    cur.execute("SELECT set_config('ivfflat.iterative_scan', 'relaxed_order', true)")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT iterativ")
+                    log.info("Iterativ indexskanning saknas (pgvector < 0.8?): %s", exc)
             cur.execute(sql, params)
-            rader = cur.fetchall()
+            rader = sorted(cur.fetchall(), key=lambda r: r[3] or 0.0, reverse=True)
     except Exception as exc:
         log.error("vektor_sok misslyckades: %s", exc)
         return []

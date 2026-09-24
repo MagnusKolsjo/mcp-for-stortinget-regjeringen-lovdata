@@ -73,8 +73,13 @@ python3 nor_embedding.py
 python3 nor_embedding.py --bygg-index
 ```
 
-Lovtidend embeddas bara på uttrycklig begäran (`--kilde lovtidend`); den
-nås annars med fulltextsökning och uppslag på ändrad författning.
+Standardkörningen embeddar alla källor, även Norsk Lovtidend, och
+embeddar om dokument vars text ändrats sedan förra körningen. Första
+körningen efter att Lovtidend lästs in är lång: omkring 40 000 dokument ger
+400 000–600 000 chunks, i storleksordningen en till en och en halv timme
+(cirka 120 chunks/s med GPU/MPS; betydligt längre på bara CPU) och 4–6 GB i
+Postgres inklusive index. Bygg sedan om IVFFlat-indexet med ett större
+`--lists`, ungefär roten ur antalet chunks (t.ex. `--bygg-index --lists 900`).
 
 ---
 
@@ -123,7 +128,7 @@ bash synk_daglig.sh --installera-schema
 | `nor_sok_stortinget` | Söker saker, spørsmål och høringer i Stortinget för en given session |
 | `nor_sok_lovdata` | Söker i lokal Lovdata-cache: gällande lagar och forskrifter, eller Lovtidend (`dok_type='lovtidend'`) |
 | `nor_sok_i_dokument` | Sökning inom ett specifikt cachat dokument, avsnitt för avsnitt — alla källor |
-| `nor_sok_semantisk` | Semantisk sökning med pgvector (kräver PostgreSQL + embeddings) |
+| `nor_sok_semantisk` | Semantisk sökning med pgvector (kräver PostgreSQL + embeddings); `dok_type` väljer dokumenttyp, standard allt utom Lovtidend |
 
 ### Hämtning av dokument
 

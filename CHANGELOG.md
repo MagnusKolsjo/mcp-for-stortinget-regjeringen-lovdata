@@ -34,7 +34,10 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
   Stortinget saknar godkända skriftliga innspill.
 - Lovdata-synken hoppar över ett paket vars `lastModified` i Lovdatas lista
   inte ändrats sedan förra synken, utan att ladda ned det.
-- `nor_embedding.py` embeddar Lovtidend bara med `--kilde lovtidend`.
+- `nor_embedding.py` embeddar Norsk Lovtidend i standardkörningen
+  (`--kilde alla`); `--kilde lovtidend` embeddar bara Lovtidend. Första
+  körningen efter att Lovtidend lästs in ger 400 000–600 000 chunks och tar
+  i storleksordningen en timme eller mer.
 - `max_tecken=0` betyder upp till serverns övre tak på 200 000 tecken
   (`NOR_TAK_TECKEN`) i stället för hela texten. Svaret skickas både som text
   och som struktur, och en hel proposisjon gav annars nästan 2 MB. Resten
@@ -49,6 +52,12 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 - `nor_sok_lovdata(dok_type='lovtidend')`. En författningsreferens som term
   (`LOV-2005-06-17-62`, `NL/lov/2005-06-17-62`) listar de kungjorda dokument
   som ändrar författningen, nyast först, med `endrer` och `ikraft`.
+- Valfri parameter `dok_type` i `nor_sok_semantisk`. Standard `'alla'` söker
+  i allt utom Lovtidend, så att ändringslagar inte tränger undan gällande
+  rätt; `'lovtidend'`, `'alla_med_lovtidend'` eller en enskild dokumenttyp
+  väljer annat. Vektorsökningen använder iterativ indexskanning (pgvector
+  0.8+) när ett filter är satt, så att filtret inte ger för få träffar.
+- `nor_sok_i_dokument` visar dokumentets `dok_type`.
 - Kolumnerna `endrer` och `ikraft` i `dokument`, tillagda som migrationer
   ovanpå det låsta bas-schemat.
 - `max_tecken` och `fran_tecken` i `nor_hamta_regjeringen` (standard 60 000
