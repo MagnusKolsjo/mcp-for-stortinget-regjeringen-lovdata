@@ -240,15 +240,6 @@ def _parsera_datum(text: str) -> Optional[date]:
         return None
 
 
-def _kapitel_rubrik(section) -> str:
-    """Extraherar kapitelrubrik ur ett <section>-element."""
-    for tag in ("h2", "h3", "h4"):
-        h = section.find(tag)
-        if h:
-            return _text(h)
-    return ""
-
-
 def html_till_markdown(html: str, dok_typ: str) -> tuple[dict, str]:
     """
     Parserar ett Lovdata HTML-dokument och returnerar (metadata, fulltext_md).
@@ -319,38 +310,18 @@ def html_till_markdown(html: str, dok_typ: str) -> tuple[dict, str]:
     linjer.append("---")
     linjer.append("")
 
-    # Lovtekst — itererera kapitel och paragrafer
-    # Lagar använder <section> för kapitel; forskrifter har bara <main>/<body>
-    body = soup.find("body")
-    if not body:
-        return metadata, "\n".join(linjer)
+    # Lovtexten går genom samma genomgång av dokumentkroppen som Lovtidend.
+    # Den tidigare läsningen tog bara legalArticle/legalP inom <section>, och
+    # tappade därmed listor, tabeller, ändringsparagrafer och text utanför
+    # paragraferna — en fjärdedel av lagarna fick under 80 % av texten.
+    main = soup.find("main") or soup.find("body")
+    if main is not None:
+        header = main.find("header")
+        if header:
+            header.decompose()
+        _barn_till_md(main, linjer, i_endring=False)
 
-    # Fjern headern (metadata-blocket) ur body
-    header = body.find("header")
-    if header:
-        header.decompose()
-
-    # Hitta dokumentkroppen (lagar: <body>, forskrifter: <main class="documentBody">)
-    main = body.find("main") or body
-    sektioner = main.find_all("section", recursive=False)
-    if not sektioner:
-        sektioner = main.find_all("section")
-
-    if sektioner:
-        # Lagar: kapitelstruktur via <section>
-        for seksjon in sektioner:
-            rubrik = _kapitel_rubrik(seksjon)
-            if rubrik:
-                linjer.append(f"## {rubrik}")
-                linjer.append("")
-            for article in seksjon.find_all("article", class_="legalArticle"):
-                _artikel_till_md(article, linjer)
-    else:
-        # Forskrifter och kortare lagar: paragrafer direkt under main
-        for article in main.find_all("article", class_="legalArticle"):
-            _artikel_till_md(article, linjer)
-
-    return metadata, "\n".join(linjer)
+    return metadata, re.sub(r"\n{3,}", "\n\n", "\n".join(linjer)).strip() + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -427,14 +398,14 @@ def _block_till_md(el, linjer: list[str], i_endring: bool = False) -> None:
 
     if namn == "h1":
         return  # dokumenttiteln står redan överst
+    if klass & _RUBRIKKLASSER:
+        return  # paragrafrubriken (h2–h5 eller span) skrivs av paragrafen själv
     if namn in ("h2", "h3", "h4", "h5", "h6"):
         linjer += ["", f"## {_ren(el.get_text())}", ""]
         return
     if namn == "span" and "futuretitle" in klass:
         linjer += ["", f"**{_ren(el.get_text())}**"]
         return
-    if namn == "span" and klass & _RUBRIKKLASSER:
-        return  # skrivs av paragrafen själv
 
     if namn == "article" and klass & {"legalArticle", "futureLegalArticle"}:
         rubrik = _paragraf_rubrik(el)
@@ -462,6 +433,14 @@ def _block_till_md(el, linjer: list[str], i_endring: bool = False) -> None:
                 t = _ren(str(barn))
                 if t:
                     linjer += ["", t]
+        return
+
+    if namn == "article" and "changesToParent" in klass:
+        # Endringshistoriken per paragraf skrivs kursivt, som i den tidigare
+        # utdatan; nor_sok_i_dokument filtrerar bort kursiv text i träffarna.
+        text = _ren(el.get_text())
+        if text:
+            linjer += ["", f"*{text}*"]
         return
 
     if namn == "li":
@@ -581,42 +560,6 @@ def _lovtidend_till_markdown(soup: BeautifulSoup) -> tuple[dict, str]:
     # Tomrader från blockgränserna slås ihop till en.
     text = re.sub(r"\n{3,}", "\n\n", "\n".join(linjer)).strip() + "\n"
     return metadata, text
-
-
-def _artikel_till_md(article, linjer: list[str]) -> None:
-    """Lägger till en legalArticle som Markdown-paragraf i linjer-listan."""
-    para_nr   = article.get("data-name", "")
-    # Lagar: <h4 class="legalArticleHeader">, forskrifter: <h2 class="legalArticleHeader">
-    header_el = article.find(["h2", "h3", "h4"], class_="legalArticleHeader")
-
-    if header_el:
-        nr_el    = header_el.find("span", class_="legalArticleValue")
-        tittel_el = header_el.find("span", class_="legalArticleTitle")
-        nr_text   = _text(nr_el) if nr_el else para_nr
-        tittel_text = _text(tittel_el) if tittel_el else ""
-        if tittel_text:
-            linjer.append(f"### {nr_text}. {tittel_text}")
-        else:
-            linjer.append(f"### {nr_text}")
-    elif para_nr:
-        linjer.append(f"### {para_nr}")
-
-    # Ledd (stycken)
-    for ledd in article.find_all("article", class_="legalP"):
-        ledd_text = _text(ledd)
-        if ledd_text:
-            linjer.append("")
-            linjer.append(ledd_text)
-
-    # Endringer/tillägg (enklare historiknotering)
-    endring = article.find("article", class_="changesToParent")
-    if endring:
-        endring_text = _text(endring)
-        if endring_text:
-            linjer.append("")
-            linjer.append(f"*{endring_text}*")
-
-    linjer.append("")
 
 
 # ---------------------------------------------------------------------------

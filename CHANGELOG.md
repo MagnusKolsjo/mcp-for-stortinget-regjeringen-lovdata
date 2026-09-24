@@ -61,6 +61,14 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- **Gällande lagar och forskrifter tappade text.** Parsern läste bara
+  paragrafer och stycken inom kapitlen och tappade listor, tabeller,
+  ändringsparagrafer och text utanför paragraferna: 226 av 757 lagar och
+  1 188 av 3 422 forskrifter fick under 80 % av texten. Gjeldende-paketen går
+  nu genom samma genomgång av dokumentkroppen som Lovtidend, med kapitel som
+  `## ` och paragrafer som `### `. Texterna ändras därför vid nästa synk, och
+  embeddings byggs om för dem.
+
 - **`nor_hamta_vedtak(vedtakid=...)` var en dold bulkhämtning.** Stortinget
   har ingen endpoint för ett enskilt vedtak och ignorerar `vedtakid`, så
   anropet hämtade innevarande sessions samtliga vedtak (över 7 MB) och
