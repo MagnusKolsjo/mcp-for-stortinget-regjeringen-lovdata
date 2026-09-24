@@ -70,16 +70,40 @@ Generera embeddings för semantisk sökning (kräver PostgreSQL + pgvector):
 
 ```
 python3 nor_embedding.py
-python3 nor_embedding.py --bygg-index
+python3 nor_embedding.py --bygg-index --minne 4GB
 ```
 
 Standardkörningen embeddar alla källor, även Norsk Lovtidend, och
 embeddar om dokument vars text ändrats sedan förra körningen. Första
 körningen efter att Lovtidend lästs in är lång: omkring 40 000 dokument ger
 400 000–600 000 chunks, i storleksordningen en till en och en halv timme
-(cirka 120 chunks/s med GPU/MPS; betydligt längre på bara CPU) och 4–6 GB i
-Postgres inklusive index. Bygg sedan om IVFFlat-indexet med ett större
-`--lists`, ungefär roten ur antalet chunks (t.ex. `--bygg-index --lists 900`).
+(cirka 120 chunks/s med GPU/MPS; betydligt längre på bara CPU).
+
+Embeddings lagras som `halfvec(768)` med ett HNSW-index (m=16,
+ef_construction=64): omkring 4,5 kB per chunk inklusive index, alltså
+ungefär 2,5 GB för Lovtidend. HNSW tål att chunks läggs till och behöver inte
+byggas om efter varje körning. `--bygg-index` bygger om det, vilket går
+mycket snabbare när grafen ryms i `maintenance_work_mem` (drygt 2 kB per
+chunk, `--minne`). Sökdjupet styrs av `NOR_HNSW_EF_SEARCH` (standard 100).
+
+## Uppgradering av en befintlig installation (från 1.1.0)
+
+Ordningen spelar roll; steg 3 och 4 ändrar databasen och tar tid.
+
+1. Installera den nya koden och `requirements.txt` (mcp 2.x) och starta
+   servern en gång. Uppstarten lägger till de nya kolumnerna. En databas med
+   fler än 50 000 chunks lagrar fortfarande embeddings som `vector` med
+   IVFFlat; det loggas, och servern fungerar ändå. Mindre databaser
+   konverteras direkt vid uppstarten.
+2. Synka Lovdata (`bash synk_daglig.sh` eller `python3 lovdata_sync.py`).
+   Första synken läser in Lovtidend och läser om gällande lagar och
+   forskrifter med den nya parsern.
+3. Byt vektorlagringen till `halfvec` med HNSW-index före den stora
+   embeddingkörningen, så att de nya chunks skrivs som `halfvec` direkt:
+   `python3 konvertera_vektorer.py --torrkorning`, därefter
+   `python3 konvertera_vektorer.py --minne 4GB`. `norge.chunks` är låst under
+   omskrivningen; semantiska sökningar väntar tills den är klar.
+4. Embedda: `python3 nor_embedding.py` (se tidsuppskattningen ovan).
 
 ---
 

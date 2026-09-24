@@ -45,6 +45,21 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Tillagt
 
+- Embeddings lagras som `halfvec(768)` med HNSW-index (m=16,
+  ef_construction=64) i stället för `vector(768)` med IVFFlat: hälften så
+  stor vektorlagring och ett index som tål inskrivningar. Servern läser
+  kolumntypen och fungerar före och efter konverteringen. Tabeller under
+  50 000 chunks konverteras vid uppstart; större med
+  `konvertera_vektorer.py` (`--torrkorning` visar tid, disk och slutstorlek).
+  Mätt på 211 000 chunks: exakt samma topp-10 som med `vector`, recall@10
+  1,00 mot 0,69 för IVFFlat med probes=1, och tabell plus index från 2,0 till
+  0,9 GB.
+- `ef_search` (`NOR_HNSW_EF_SEARCH`, standard 100), `probes` och iterativ
+  indexskanning sätts per fråga, så att en sökning filtrerad på källa eller
+  dokumenttyp fyller träfflistan.
+- `nor_embedding.py --bygg-index` bygger HNSW; `--lists` ersätts av
+  `--minne` och `--parallella`.
+
 - **Norsk Lovtidend avd. I** (2001–) som dokumenttyp `lovtidend` i
   Lovdata-cachen, synkad från `lovtidend-avd1-<år1>-<år2>` och
   `lovtidend-avd1-<innevarande år>`. Paketen väljs ur Lovdatas lista, så
@@ -112,6 +127,21 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 ## [1.1.0] — 2026-08-10
 
 ### Tillagt
+
+- Embeddings lagras som `halfvec(768)` med HNSW-index (m=16,
+  ef_construction=64) i stället för `vector(768)` med IVFFlat: hälften så
+  stor vektorlagring och ett index som tål inskrivningar. Servern läser
+  kolumntypen och fungerar före och efter konverteringen. Tabeller under
+  50 000 chunks konverteras vid uppstart; större med
+  `konvertera_vektorer.py` (`--torrkorning` visar tid, disk och slutstorlek).
+  Mätt på 211 000 chunks: exakt samma topp-10 som med `vector`, recall@10
+  1,00 mot 0,69 för IVFFlat med probes=1, och tabell plus index från 2,0 till
+  0,9 GB.
+- `ef_search` (`NOR_HNSW_EF_SEARCH`, standard 100), `probes` och iterativ
+  indexskanning sätts per fråga, så att en sökning filtrerad på källa eller
+  dokumenttyp fyller träfflistan.
+- `nor_embedding.py --bygg-index` bygger HNSW; `--lists` ersätts av
+  `--minne` och `--parallella`.
 
 - **`nor_lista_publikasjoner(sakid)`** — listar en saks publikationsreferenser utan
   fulltext. Sökträffar saknar publikationer eftersom Stortingets listendpoint
@@ -190,6 +220,21 @@ behöva ett nytt servernamn i konfigurationen för att se det.
 
 ### Tillagt
 
+- Embeddings lagras som `halfvec(768)` med HNSW-index (m=16,
+  ef_construction=64) i stället för `vector(768)` med IVFFlat: hälften så
+  stor vektorlagring och ett index som tål inskrivningar. Servern läser
+  kolumntypen och fungerar före och efter konverteringen. Tabeller under
+  50 000 chunks konverteras vid uppstart; större med
+  `konvertera_vektorer.py` (`--torrkorning` visar tid, disk och slutstorlek).
+  Mätt på 211 000 chunks: exakt samma topp-10 som med `vector`, recall@10
+  1,00 mot 0,69 för IVFFlat med probes=1, och tabell plus index från 2,0 till
+  0,9 GB.
+- `ef_search` (`NOR_HNSW_EF_SEARCH`, standard 100), `probes` och iterativ
+  indexskanning sätts per fråga, så att en sökning filtrerad på källa eller
+  dokumenttyp fyller träfflistan.
+- `nor_embedding.py --bygg-index` bygger HNSW; `--lists` ersätts av
+  `--minne` och `--parallella`.
+
 **Lovdata: dynamisk paketsupptäckt**
 - `hamta_lovdata_paket_lista()` i `lovdata_sync.py` — anropar `/v1/publicData/list` vid varje synk och returnerar tillgängliga paketnamn
 - URL:er för nedladdning byggs nu dynamiskt: `https://api.lovdata.no/v1/publicData/get/{paket_namn}.tar.bz2` istället för hårdkodade strängar
@@ -229,6 +274,21 @@ behöva ett nytt servernamn i konfigurationen för att se det.
 ## [1.0.0] — 2026-05-15
 
 ### Tillagt
+
+- Embeddings lagras som `halfvec(768)` med HNSW-index (m=16,
+  ef_construction=64) i stället för `vector(768)` med IVFFlat: hälften så
+  stor vektorlagring och ett index som tål inskrivningar. Servern läser
+  kolumntypen och fungerar före och efter konverteringen. Tabeller under
+  50 000 chunks konverteras vid uppstart; större med
+  `konvertera_vektorer.py` (`--torrkorning` visar tid, disk och slutstorlek).
+  Mätt på 211 000 chunks: exakt samma topp-10 som med `vector`, recall@10
+  1,00 mot 0,69 för IVFFlat med probes=1, och tabell plus index från 2,0 till
+  0,9 GB.
+- `ef_search` (`NOR_HNSW_EF_SEARCH`, standard 100), `probes` och iterativ
+  indexskanning sätts per fråga, så att en sökning filtrerad på källa eller
+  dokumenttyp fyller träfflistan.
+- `nor_embedding.py --bygg-index` bygger HNSW; `--lists` ersätts av
+  `--minne` och `--parallella`.
 
 **Stortinget (grundstruktur)**
 - `mcp_server.py` med FastMCP och stöd för både stdio- och HTTP-transport (`MCP_TRANSPORT` i `.env`)
