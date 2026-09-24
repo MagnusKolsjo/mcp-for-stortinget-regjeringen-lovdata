@@ -22,6 +22,7 @@ Användning:
 """
 
 import argparse
+import hashlib
 import logging
 import os
 import re
@@ -184,8 +185,16 @@ def chunka_text(text: str) -> list[dict]:
 
 # ── Databas ────────────────────────────────────────────────────────────────────
 
-def _hamta_dokument_utan_chunks(kilde: str | None, tvinga: bool) -> list[dict]:
-    """Returnerar dokument som saknar chunks (eller alla om tvinga=True)."""
+def _hamta_dokument_att_embedda(kilde: str | None, tvinga: bool) -> list[dict]:
+    """
+    Returnerar dokument vars chunks saknas eller byggdes ur en annan text än
+    den nuvarande (eller alla om tvinga=True).
+
+    Jämförelsen går på chunk_hash, md5 av texten vid senaste chunkningen.
+    Ett dokument som uppdateras i synken får därmed nya chunks och
+    embeddings vid nästa körning; tidigare fick bara dokument helt utan
+    chunks några.
+    """
     from db import _cursor, _ar_postgres, _prefix
 
     if not _ar_postgres():
@@ -198,12 +207,10 @@ def _hamta_dokument_utan_chunks(kilde: str | None, tvinga: bool) -> list[dict]:
         villkor = "WHERE d.fulltext_md IS NOT NULL AND d.fulltext_md != ''"
         params: tuple = ()
     else:
-        villkor = f"""
+        villkor = """
             WHERE d.fulltext_md IS NOT NULL
               AND d.fulltext_md != ''
-              AND NOT EXISTS (
-                  SELECT 1 FROM {pfx}chunks c WHERE c.dok_id = d.id
-              )
+              AND d.chunk_hash IS DISTINCT FROM md5(d.fulltext_md)
         """
         params = ()
 
@@ -259,13 +266,20 @@ def _hamta_fulltext(dok_id: int) -> str | None:
     return rad[0] if rad else None
 
 
-def _spara_chunks(dok_id: int, chunks: list[dict], embeddings):
-    """Tar bort befintliga chunks och sparar nya med embeddings."""
+def _spara_chunks(dok_id: int, chunks: list[dict], embeddings, text_hash: str):
+    """
+    Ersätter dokumentets chunks med nya och sparar textens hash, i en
+    transaktion. Tom chunklista tar bara bort de gamla.
+    """
     from db import _cursor, _prefix
 
     pfx = _prefix()
     with _cursor() as cur:
         cur.execute(f"DELETE FROM {pfx}chunks WHERE dok_id = %s", (dok_id,))
+        cur.execute(
+            f"UPDATE {pfx}dokument SET chunk_hash = %s WHERE id = %s",
+            (text_hash, dok_id),
+        )
         for ch, emb in zip(chunks, embeddings):
             cur.execute(
                 f"""
@@ -297,8 +311,15 @@ def embed_dokument(dok_id: int, tittel: str) -> int:
     if not text:
         return 0
 
+    # Samma hash som Postgres md5() på kolumnen (UTF-8), så att urvalet i
+    # _hamta_dokument_att_embedda känner igen texten som behandlad.
+    text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+
     chunks = chunka_text(text)
     if not chunks:
+        # Texten ger inga chunks (för kort); gamla chunks tas bort och
+        # hashen sparas, så att dokumentet inte väljs om vid varje körning.
+        _spara_chunks(dok_id, [], [], text_hash)
         return 0
 
     modell = _hamta_modell()
@@ -323,17 +344,18 @@ def embed_dokument(dok_id: int, tittel: str) -> int:
         _os.close(save_fd1)
         _os.close(log_fd)
 
-    _spara_chunks(dok_id, chunks, embeddings)
+    _spara_chunks(dok_id, chunks, embeddings, text_hash)
     return len(chunks)
 
 
 def kör_embedding(kilde: str | None = None, tvinga: bool = False) -> dict:
     """
-    Huvud-entry-point. Embeddar alla dokument som saknar chunks.
+    Huvud-entry-point. Embeddar dokument som saknar chunks eller vars text
+    ändrats sedan de chunkades.
 
     Returnerar statistik: {total, lyckade, hoppade, fel, chunks_totalt}
     """
-    dokument = _hamta_dokument_utan_chunks(kilde, tvinga)
+    dokument = _hamta_dokument_att_embedda(kilde, tvinga)
 
     if not dokument:
         log.info("Inga dokument att embeda.")

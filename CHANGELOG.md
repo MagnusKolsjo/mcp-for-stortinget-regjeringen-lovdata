@@ -61,6 +61,13 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- **Uppdaterade dokument fick aldrig nya embeddings.** `nor_embedding.py`
+  valde bara dokument helt utan chunks, så en lag som ändrats i synken
+  behöll vektorer byggda ur den gamla texten. Den nya kolumnen `chunk_hash`
+  (md5 av texten vid chunkningen) jämförs nu med nuvarande text, och ändrade
+  dokument chunkas och embeddas om. Befintliga chunks antas vid migreringen
+  höra till nuvarande text.
+
 - **Gällande lagar och forskrifter tappade text.** Parsern läste bara
   paragrafer och stycken inom kapitlen och tappade listor, tabeller,
   ändringsparagrafer och text utanför paragraferna: 226 av 757 lagar och

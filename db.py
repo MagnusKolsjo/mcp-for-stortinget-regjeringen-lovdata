@@ -142,8 +142,8 @@ def _kor_migrationer(conn) -> None:
 
     Bas-schemat i db/schema_*.sql är låst sedan 1.0.0 och ändras aldrig;
     befintliga installationer får nya kolumner och index härifrån. Varje
-    steg är idempotent och körs vid varje start. Stegen är ren DDL, så de
-    committas tillsammans med bas-schemat.
+    steg är idempotent och körs vid varje start. Ren DDL committas
+    tillsammans med bas-schemat; datamigreringar får en egen transaktion.
     """
     # Lovtidend avd. I: vilka författningar ett kungjort dokument ändrar
     # (Lovdatas refid, blankstegsseparerade, t.ex. 'lov/1999-07-02-64') och
@@ -160,6 +160,30 @@ def _kor_migrationer(conn) -> None:
         for kolumn, typ in nya_kolumner:
             if not _kolumn_finns(conn, "dokument", kolumn):
                 conn.execute(f"ALTER TABLE dokument ADD COLUMN {kolumn} {typ}")
+
+    # chunk_hash: md5 av den fulltext som chunks och embeddings byggdes ur.
+    # nor_embedding.py jämför den med nuvarande text, så att ett dokument vars
+    # text ändrats i en synk får nya chunks. Utan den fick bara dokument helt
+    # utan chunks några, och uppdaterade texter behöll gamla vektorer.
+    if _ar_postgres():
+        with conn.cursor() as cur:
+            cur.execute(
+                f"ALTER TABLE {_prefix()}dokument ADD COLUMN IF NOT EXISTS chunk_hash TEXT"
+            )
+        # Datamigrering i egen transaktion (efter DDL:en ovan). Befintliga
+        # chunks antas höra till nuvarande text; annars skulle varje dokument
+        # embeddas om. Idempotent: rör bara rader utan hash som har chunks.
+        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                UPDATE {_prefix()}dokument d
+                SET    chunk_hash = md5(d.fulltext_md)
+                WHERE  d.chunk_hash IS NULL
+                  AND  d.fulltext_md IS NOT NULL
+                  AND  EXISTS (SELECT 1 FROM {_prefix()}chunks c WHERE c.dok_id = d.id)
+            """)
+    elif not _kolumn_finns(conn, "dokument", "chunk_hash"):
+        conn.execute("ALTER TABLE dokument ADD COLUMN chunk_hash TEXT")
 
 
 # ---------------------------------------------------------------------------
