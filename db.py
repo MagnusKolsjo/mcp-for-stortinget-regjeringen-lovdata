@@ -129,6 +129,130 @@ def initiera_schema():
             "Verktygsanrop felar tills databasen är tillgänglig.",
             exc,
         )
+        return
+
+    if _ar_postgres():
+        try:
+            _migrera_halfvec()
+        except Exception as exc:
+            log.warning("Konverteringen till halfvec vid uppstart misslyckades: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Vektorlagring: vector eller halfvec
+# ---------------------------------------------------------------------------
+# Embeddings lagras som halfvec(768) (16-bitars flyttal): hälften så stort
+# som vector(768), och topp-10 i cosinussökning påverkas inte mätbart.
+# Äldre databaser har vector(768) tills konvertera_vektorer.py körts; frågor
+# och inskrivningar läser därför kolumntypen och castar därefter, så att
+# servern fungerar före och efter konverteringen.
+#
+# Index: HNSW (m=16, ef_construction=64). IVFFlat-centroiderna beräknas en
+# gång vid bygget och passar allt sämre när synken lägger till chunks, och
+# med pgvectors standard probes=1 läses bara en lista av hundra. HNSW tål
+# inskrivningar och styrs per fråga av ef_search.
+
+VEKTOR_DIM = 768
+VEKTORINDEX = "idx_nor_chunks_embedding"
+HNSW_M = 16
+HNSW_EF_CONSTRUCTION = 64
+HNSW_EF_SEARCH = int(os.getenv("NOR_HNSW_EF_SEARCH", "100"))
+# Gäller bara ett IVFFlat-index, dvs. en databas som ännu inte konverterats.
+# Varje probe läser ungefär 1/lists av vektorerna ur TOAST; fler probes gör
+# sökningen i en stor tabell långsam. 1 är pgvectors eget standardvärde.
+IVFFLAT_PROBES = int(os.getenv("NOR_IVFFLAT_PROBES", "1"))
+
+# Under den här storleken konverteras kolumnen automatiskt vid uppstart
+# (ny eller nästan tom databas). Större tabeller konverteras med
+# konvertera_vektorer.py, eftersom omskrivningen tar tid och disk.
+AUTO_KONVERTERA_MAX_RADER = 50_000
+
+
+def vektortyp(cur=None) -> str:
+    """'halfvec' eller 'vector' för norge.chunks.embedding."""
+    sql = """SELECT format_type(a.atttypid, a.atttypmod)
+             FROM pg_attribute a
+             WHERE a.attrelid = 'norge.chunks'::regclass AND a.attname = 'embedding'"""
+    if cur is not None:
+        cur.execute(sql)
+        rad = cur.fetchone()
+    else:
+        with _cursor() as c:
+            c.execute(sql)
+            rad = c.fetchone()
+    return "halfvec" if rad and rad[0].startswith("halfvec") else "vector"
+
+
+def _sokinstallningar(cur) -> None:
+    """
+    Sökparametrar för vektorindexet; gäller bara transaktionen.
+
+    Iterativ skanning (pgvector 0.8+) gör att en filtrerad sökning (kilde,
+    dok_type) fortsätter i indexet tills LIMIT är fylld i stället för att ge
+    för få träffar. Ordningen blir då ungefärlig; vektor_sok sorterar om.
+    """
+    cur.execute(f"SET LOCAL hnsw.ef_search = {HNSW_EF_SEARCH}")
+    cur.execute(f"SET LOCAL ivfflat.probes = {IVFFLAT_PROBES}")
+    cur.execute("SAVEPOINT iterativ")
+    try:
+        cur.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+        cur.execute("SET LOCAL ivfflat.iterative_scan = relaxed_order")
+    except Exception as exc:
+        cur.execute("ROLLBACK TO SAVEPOINT iterativ")
+        log.info("Iterativ indexskanning saknas (pgvector < 0.8?): %s", exc)
+
+
+def bygg_vektorindex(minne: Optional[str] = None, parallella: Optional[int] = None) -> None:
+    """
+    Bygger om vektorindexet som HNSW med operatorklass efter kolumntypen.
+
+    HNSW-bygget går mycket snabbare när grafen ryms i maintenance_work_mem
+    (drygt 2 kB per chunk). Anges minne sätts det för sessionen.
+    """
+    with _cursor() as cur:
+        ops = "halfvec_cosine_ops" if vektortyp(cur) == "halfvec" else "vector_cosine_ops"
+        if minne:
+            cur.execute("SELECT set_config('maintenance_work_mem', %s, true)", (minne,))
+        if parallella is not None:
+            cur.execute(f"SET LOCAL max_parallel_maintenance_workers = {int(parallella)}")
+        cur.execute(f"DROP INDEX IF EXISTS norge.{VEKTORINDEX}")
+        cur.execute(
+            f"CREATE INDEX {VEKTORINDEX} ON norge.chunks USING hnsw (embedding {ops}) "
+            f"WITH (m = {HNSW_M}, ef_construction = {HNSW_EF_CONSTRUCTION})"
+        )
+
+
+def konvertera_till_halfvec(cur) -> None:
+    """
+    Byter norge.chunks.embedding till halfvec(768). Skriver om hela tabellen.
+
+    Vektorindexet tas bort först, eftersom dess operatorklass gäller vector.
+    Anroparen bygger nytt index efteråt (bygg_vektorindex).
+    """
+    cur.execute(f"DROP INDEX IF EXISTS norge.{VEKTORINDEX}")
+    cur.execute(
+        f"ALTER TABLE norge.chunks ALTER COLUMN embedding "
+        f"TYPE halfvec({VEKTOR_DIM}) USING embedding::halfvec({VEKTOR_DIM})"
+    )
+
+
+def _migrera_halfvec() -> None:
+    """Konverterar en liten tabell till halfvec vid uppstart; stora lämnas till skriptet."""
+    with _cursor() as cur:
+        if vektortyp(cur) == "halfvec":
+            return
+        cur.execute(
+            f"SELECT count(*) FROM (SELECT 1 FROM norge.chunks LIMIT {AUTO_KONVERTERA_MAX_RADER + 1}) x"
+        )
+        if cur.fetchone()[0] > AUTO_KONVERTERA_MAX_RADER:
+            log.info(
+                "norge.chunks lagrar embeddings som vector. Kör "
+                "konvertera_vektorer.py för att byta till halfvec och HNSW."
+            )
+            return
+        konvertera_till_halfvec(cur)
+    bygg_vektorindex()
+    log.info("Embeddings konverterade till halfvec(%d) med HNSW-index", VEKTOR_DIM)
 
 
 def _kolumn_finns(conn, tabell: str, kolumn: str) -> bool:
@@ -632,7 +756,7 @@ def vektor_sok(
             c.dok_id,
             c.chunk_index,
             c.text,
-            1 - (c.embedding <=> %s::vector)  AS likhet,
+            1 - (c.embedding <=> %s::{{typ}})  AS likhet,
             d.kilde,
             d.dok_type,
             d.beteckning,
@@ -644,25 +768,14 @@ def vektor_sok(
         JOIN   {_prefix()}dokument d ON d.id = c.dok_id
         WHERE  c.embedding IS NOT NULL
         {where_extra}
-        ORDER  BY c.embedding <=> %s::vector
+        ORDER  BY c.embedding <=> %s::{{typ}}
         LIMIT  %s
     """
 
     try:
         with _cursor() as cur:
-            if villkor:
-                # IVFFlat-indexet letar i ett fåtal listor och filtrerar
-                # efteråt. När filtret utesluter de flesta chunks (Lovtidend
-                # står för merparten) blir det då för få träffar. Iterativ
-                # skanning (pgvector 0.8+) fortsätter tills LIMIT är fylld;
-                # ordningen kan bli ungefärlig och sorteras därför om nedan.
-                cur.execute("SAVEPOINT iterativ")
-                try:
-                    cur.execute("SELECT set_config('ivfflat.iterative_scan', 'relaxed_order', true)")
-                except Exception as exc:
-                    cur.execute("ROLLBACK TO SAVEPOINT iterativ")
-                    log.info("Iterativ indexskanning saknas (pgvector < 0.8?): %s", exc)
-            cur.execute(sql, params)
+            _sokinstallningar(cur)
+            cur.execute(sql.format(typ=vektortyp(cur)), params)
             rader = sorted(cur.fetchall(), key=lambda r: r[3] or 0.0, reverse=True)
     except Exception as exc:
         log.error("vektor_sok misslyckades: %s", exc)

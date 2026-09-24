@@ -269,10 +269,13 @@ def _spara_chunks(dok_id: int, chunks: list[dict], embeddings, text_hash: str):
     Ersätter dokumentets chunks med nya och sparar textens hash, i en
     transaktion. Tom chunklista tar bara bort de gamla.
     """
-    from db import _cursor, _prefix
+    from db import _cursor, _prefix, vektortyp
 
     pfx = _prefix()
     with _cursor() as cur:
+        # Kolumnen är vector eller halfvec beroende på om databasen
+        # konverterats (konvertera_vektorer.py); vektorn castas därefter.
+        typ = vektortyp(cur)
         cur.execute(f"DELETE FROM {pfx}chunks WHERE dok_id = %s", (dok_id,))
         cur.execute(
             f"UPDATE {pfx}dokument SET chunk_hash = %s WHERE id = %s",
@@ -284,7 +287,7 @@ def _spara_chunks(dok_id: int, chunks: list[dict], embeddings, text_hash: str):
                 INSERT INTO {pfx}chunks
                     (dok_id, chunk_index, text, tecken_start, tecken_slut,
                      tecken_overlapp, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s, %s::vector)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::{typ})
                 """,
                 (
                     dok_id,
@@ -397,38 +400,27 @@ def kör_embedding(kilde: str | None = None, tvinga: bool = False) -> dict:
     return stat
 
 
-# ── IVFFlat-index ──────────────────────────────────────────────────────────────
+# ── Vektorindex ────────────────────────────────────────────────────────────────
 
-def bygg_ivfflat_index(lists: int = 100):
+def bygg_index(minne: str | None = None, parallella: int | None = None):
     """
-    Bygger IVFFlat-index för ANN-sökning i chunks-tabellen.
+    Bygger om HNSW-indexet för chunks-tabellen (db.bygg_vektorindex).
 
-    Ska köras EFTER att data laddats in — indexet är statiskt och måste
-    byggas om när mer än ~20 % ny data tillkommer.
-
-    Rekommenderat lists-värde: sqrt(antal_rader). För ~100k chunks: 316.
-    Standard: 100 (lämpligt för <50k chunks).
+    HNSW tål att chunks läggs till efteråt, så indexet behöver inte byggas om
+    efter varje körning; det är främst till för en ny databas eller efter
+    en konvertering. Bygget går mycket snabbare när grafen ryms i
+    maintenance_work_mem (drygt 2 kB per chunk, --minne).
 
     Kräver PostgreSQL + pgvector.
     """
-    from db import _cursor, _ar_postgres, _prefix
+    from db import _ar_postgres, bygg_vektorindex
 
     if not _ar_postgres():
-        log.error("IVFFlat-index kräver PostgreSQL + pgvector — SQLite stöds ej.")
+        log.error("Vektorindex kräver PostgreSQL + pgvector — SQLite stöds ej.")
         return
-
-    pfx = _prefix()
-    log.info("Bygger IVFFlat-index (lists=%d)...", lists)
-    with _cursor() as cur:
-        cur.execute("DROP INDEX IF EXISTS idx_nor_chunks_embedding")
-        cur.execute(
-            f"""
-            CREATE INDEX idx_nor_chunks_embedding ON {pfx}chunks
-                USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = {lists})
-            """
-        )
-    log.info("IVFFlat-index byggt.")
+    log.info("Bygger HNSW-index (maintenance_work_mem=%s)...", minne or "serverns")
+    bygg_vektorindex(minne=minne, parallella=parallella)
+    log.info("HNSW-index byggt.")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -451,13 +443,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bygg-index",
         action="store_true",
-        help="Bygg IVFFlat-index efter att embedding körts",
+        help="Bygg om HNSW-indexet efter att embedding körts",
     )
     parser.add_argument(
-        "--lists",
+        "--minne",
+        default=None,
+        help="maintenance_work_mem för indexbygget, t.ex. 4GB (standard: serverns)",
+    )
+    parser.add_argument(
+        "--parallella",
         type=int,
-        default=100,
-        help="IVFFlat lists-parameter (standard 100)",
+        default=None,
+        help="Parallella arbetare för indexbygget (standard: serverns)",
     )
     args = parser.parse_args()
 
@@ -472,6 +469,6 @@ if __name__ == "__main__":
     if args.bygg_index:
         from db import _ar_postgres
         if _ar_postgres():
-            bygg_ivfflat_index(args.lists)
+            bygg_index(args.minne, args.parallella)
         else:
             log.error("--bygg-index kräver PostgreSQL + pgvector — SQLite stöds ej.")
