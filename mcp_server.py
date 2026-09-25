@@ -23,7 +23,7 @@ Exponerar följande verktyg till MCP-kompatibla AI-verktyg:
 Datakällor:
   Stortinget   — data.stortinget.no (XML metadata + fulltext, 1986-87+)
   Lovdata      — gratis bulk-nedladdning (daglig synk)
-  regjeringen  — proposisjoner och NOU som PDF (PDF-extraktion + OCR)
+  regjeringen  — proposisjoner och NOU som PDF (PDF-extraktion + OCR under minnesvakt)
 
 Transport (MCP_TRANSPORT i .env, se mcp_transport.py):
 
@@ -1243,7 +1243,7 @@ def _hamta_regjeringen_fra_db(url: str) -> Optional[dict]:
     URL:en och dess normaliserade form (https://www.regjeringen.no/...).
 
     Används av nor_hamta_regjeringen för att undvika dyr PDF-extraktion och
-    OCR-fallback vid återkommande anrop.
+    OCR vid återkommande anrop.
     """
     try:
         from db import _cursor, _ph, _prefix
@@ -1314,8 +1314,9 @@ def nor_hamta_regjeringen(
 
     Strategi: kollar först om dokumentet redan finns i lokal DB-cache med
     fulltext. Om så returneras det omedelbart (millisekunder). Om inte hämtas
-    det live via download → PDF-extraktion → eventuell OCR-fallback för bild-
-    baserade PDF:er, varefter resultatet cachas i DB för framtida anrop.
+    det live via download → PDF-extraktion under minnes- och tidsvakt, med
+    OCR (nor+eng) för sidor utan textlager, varefter resultatet cachas i DB
+    för framtida anrop.
 
     Parametrar:
       url       — URL till dokumentet på regjeringen.no. Accepterar:
@@ -1365,7 +1366,7 @@ def nor_hamta_regjeringen(
     Cloudflare-utmaning; meddelandet visar då vilka vägar som fungerar.
 
     OBS: Vid första hämtningen av ett stort eller bildbaserat dokument kan
-    OCR-fallbacken ta flera minuter och slå i MCP-timeouten. Efterföljande
+    OCR-steget ta flera minuter och slå i MCP-timeouten. Efterföljande
     anrop med samma URL går mot cachen och tar millisekunder.
     """
     try:
@@ -1376,7 +1377,7 @@ def nor_hamta_regjeringen(
                 {**cached, "pdf_url": None}, "db_cache", url, max_tecken, fran_tecken
             )
 
-        # Strategi 2: hämta live (PDF → markdown → eventuell OCR)
+        # Strategi 2: hämta live (PDF → markdown, OCR vid behov, under minnesvakt)
         data = rg.hamta_og_ekstraher(url)
         if not data.get("fulltext_md"):
             # hamta_og_ekstraher fångar själv sina fel, inklusive botskyddet,

@@ -30,7 +30,6 @@ uvicorn>=0.30.0
 
 # regjeringen.no PDF-pipeline
 pymupdf4llm>=0.0.17
-# ocrmypdf>=16.0.0   # OCR-fallback — kräver tesseract-ocr + nob-språkpaket
 
 # Semantisk sökning och termexpansion
 sentence-transformers>=3.0.0

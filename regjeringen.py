@@ -13,7 +13,8 @@ Strategi:
   1. Hämta HTML-sidan för dokumentet (regjeringen.no/id/... eller fullständig URL)
   2. Extrahera PDF-URL från <a href="/contentassets/...pdf">-länk
   3. Ladda ned PDF till temporär fil
-  4. Extrahera text med pymupdf4llm (OCR-fallback vid bildbaserade PDF:er)
+  4. Extrahera text under minnes- och tidsvakt, med OCR-språk nor+eng
+     för sidor utan textlager (pdftext_skydd.extrahera_pdf, se den modulen)
   5. Radera PDF omedelbart efter lyckad extraktion
   6. Returnera metadata + extraherad text
 
@@ -23,14 +24,12 @@ URL-format som hanteras:
   //www.regjeringen.no/id/...       (protokollrelativ)
   https://www.regjeringen.no/no/dokumenter/<DOK_SLUG>/id<DOC_ID>/
 
-Använder FD-1-skydd för att
-hindra pymupdf4llm:s C-backends från att skriva på FD 1 (MCP-protokollet).
+Extraktionen körs i en egen process (se pdftext_skydd.py), så den kan
+aldrig fälla MCP-servern på minne eller tid.
 """
 
-import contextlib
 import html as html_lib
 import logging
-import os
 import re
 import tempfile
 from pathlib import Path
@@ -38,6 +37,8 @@ from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
+
+from pdftext_skydd import extrahera_pdf
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -56,36 +57,6 @@ _SESSION = httpx.Client(
     follow_redirects=True,
     timeout=60,
 )
-
-
-# ---------------------------------------------------------------------------
-# FD-1-skydd
-# ---------------------------------------------------------------------------
-
-@contextlib.contextmanager
-def _tysta_subprocess_stdout():
-    """
-    Redirigerar OS-nivåns stdout (FD 1) och stderr (FD 2) till loggfil.
-
-    pymupdf4llm anropar C-bindningar som skriver direkt till FD 1.
-    I MCP-stdio-protokollet är FD 1 reserverad för JSON-RPC, varje
-    okontrollerad utskrift krossar protokollet.
-    """
-    log_path = _SCRIPT_DIR / "logs" / "subprocess.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    save_out = os.dup(1)
-    save_err = os.dup(2)
-    log_fd   = os.open(str(log_path), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    try:
-        os.dup2(log_fd, 1)
-        os.dup2(log_fd, 2)
-        yield
-    finally:
-        os.dup2(save_out, 1)
-        os.dup2(save_err, 2)
-        os.close(save_out)
-        os.close(save_err)
-        os.close(log_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -243,55 +214,19 @@ def ladda_ned_pdf(pdf_url: str, sokvag: Path) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def extrahera_text(sokvag: Path) -> Optional[str]:
+def extrahera_text(sokvag: Path, kalla: str = "") -> Optional[str]:
     """
-    Extraherar text från PDF med pymupdf4llm.
-    FD-1-skyddet hindrar C-backends från att korrumpera MCP-protokollet.
+    Extraherar text från PDF under minnes- och tidsvakt (pdftext_skydd),
+    med nor+eng som OCR-språk för sidor utan textlager.
     """
     try:
-        import pymupdf4llm
-        with _tysta_subprocess_stdout():
-            text = pymupdf4llm.to_markdown(str(sokvag))
+        res = extrahera_pdf(sokvag, prefix="NOR", standardsprak="nor+eng",
+                            kalla_id=kalla or sokvag.name, kalla_url=kalla or "")
+        text = res.text
         return text if text and len(text.strip()) > 50 else None
-    except ImportError:
-        log.warning("pymupdf4llm är inte installerat — kan inte extrahera text")
-        return None
     except Exception as exc:
         log.warning("Textextraktion misslyckades (%s): %s", sokvag.name, exc)
         return None
-
-
-def ocr_fallback(sokvag: Path) -> Optional[str]:
-    """
-    OCR-fallback för bildbaserade PDF:er via ocrmypdf + Tesseract.
-    Kräver: tesseract-ocr + nob (norsk bokmål) språkpaket.
-    """
-    try:
-        import ocrmypdf
-    except ImportError:
-        log.warning("ocrmypdf saknas — hoppar OCR-fallback")
-        return None
-
-    ocr_sokvag = sokvag.with_name(sokvag.stem + "_ocr" + sokvag.suffix)
-    try:
-        with _tysta_subprocess_stdout():
-            ocrmypdf.ocr(
-                str(sokvag), str(ocr_sokvag),
-                language="nob+nno+eng",   # Bokmål + Nynorsk + Engelska
-                progress_bar=False,
-                quiet=True,
-            )
-        text = extrahera_text(ocr_sokvag)
-        return text
-    except Exception as exc:
-        log.warning("OCR misslyckades (%s): %s", sokvag.name, exc)
-        return None
-    finally:
-        if ocr_sokvag.exists():
-            try:
-                ocr_sokvag.unlink()
-            except Exception:
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -338,15 +273,11 @@ def hamta_og_ekstraher(url: str) -> dict:
         if not ok:
             return {**metadata, "fulltext_md": None, "fel": f"PDF-nedladdning: {fel}"}
 
-        # 3. Extrahera text
-        fulltext = extrahera_text(tmp_fil)
+        # 3. Extrahera text (OCR för sidor utan textlager sker inbyggt, se
+        #    pdftext_skydd.py — inget separat OCR-fallbacksteg behövs längre)
+        fulltext = extrahera_text(tmp_fil, kalla=pdf_url)
 
-        # 4. OCR-fallback om textext misslyckades
-        if not fulltext:
-            log.info("Ingen text ur PDF — försöker OCR: %s", pdf_url)
-            fulltext = ocr_fallback(tmp_fil)
-
-        # 5. Radera PDF direkt
+        # 4. Radera PDF direkt
         try:
             tmp_fil.unlink()
         except Exception:
