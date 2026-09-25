@@ -45,6 +45,13 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Tillagt
 
+- `pdftext_skydd.py`: minnes- och tidsvakt kring PDF-extraktionen i
+  `regjeringen.py`. Extraktionen körs i en egen process, i sidblock
+  (`NOR_PDF_SIDBLOCK`), och avbryts vid `NOR_PDF_MAX_MINNE_MB` eller
+  `NOR_PDF_TIDSGRANS_S`. Block som avbryts läses om med ren textutvinning,
+  och dokument som fick minst en sida OCR:ad eller föll tillbaka på ren
+  textutvinning läggs i en OCR-kö (`NOR_OCR_KO_MAPP`) för senare, bättre OCR.
+
 - Embeddings lagras som `halfvec(768)` med HNSW-index (m=16,
   ef_construction=64) i stället för `vector(768)` med IVFFlat: hälften så
   stor vektorlagring och ett index som tål inskrivningar. Servern läser
@@ -85,6 +92,12 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Rättat
 
+- PDF-extraktionen i `regjeringen.py` OCR:ade sidor utan textlager med
+  standardspråket engelska, eftersom `pymupdf4llm.to_markdown()` aldrig fick
+  ett `ocr_language`. Norska tecken blev därmed fel. OCR-språket är nu
+  uttryckligen `nor+eng` (`NOR_OCR_SPRAK`), som täcker både bokmål och
+  nynorsk — Tesseract har inga egna `nob`/`nno`-språkpaket, så den tidigare
+  OCR-fallbackens `nob+nno+eng` hade aldrig kunnat köras.
 - **Uppdaterade dokument fick aldrig nya embeddings.** `nor_embedding.py`
   valde bara dokument helt utan chunks, så en lag som ändrats i synken
   behöll vektorer byggda ur den gamla texten. Den nya kolumnen `chunk_hash`
@@ -121,6 +134,11 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
   läget är Streamable HTTP via `mcp_transport.py`.
 - Omdirigeringen av fildeskriptor 1 kring embeddingmodellen; SDK:n skyddar
   stdio-protokollet själv.
+- `ocr_fallback()` i `regjeringen.py` och FD-1-omdirigeringen kring PDF-
+  extraktionen. `ocrmypdf` har aldrig kunnat köras (inte installerat, och
+  dess `nob+nno+eng`-språkkoder finns inte i Tesseract); OCR sker nu
+  inbyggt i `pdftext_skydd.extrahera_pdf()`, som kör i en egen process och
+  därför inte behöver skydda MCP-serverns FD 1.
 
 ---
 
