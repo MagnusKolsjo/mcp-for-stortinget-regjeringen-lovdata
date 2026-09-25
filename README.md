@@ -6,7 +6,7 @@ Verktygen har prefixet `nor_` och täcker:
 
 - **Stortinget** — saker, spørsmål, høringer, vedtak och remissvar (1986-87 och framåt)
 - **Lovdata** — gällande norska lagar och forskrifter, och Norsk Lovtidend avd. I (lokal cache, daglig synk)
-- **regjeringen.no** — proposisjoner, stortingsmeldinger och NOU som Markdown (PDF-extraktion med OCR-fallback)
+- **regjeringen.no** — proposisjoner, stortingsmeldinger och NOU som Markdown (PDF-extraktion under minnesvakt, med OCR för sidor utan textlager)
 
 Sökning stöder fulltextsökning (alla datakällor) och semantisk sökning med pgvector (kräver PostgreSQL + NbAiLab/nb-sbert-base).
 
@@ -241,6 +241,26 @@ nor_hamta_regjeringen(url=<regjeringen_url>)       → proposisjonen
 
 Proposisjoner och stortingsmeldinger distribueras inte av Stortingets API. URL:en
 till regjeringen.no finns i sakens fält `regjeringen_url`.
+
+---
+
+## PDF-extraktion — OCR-språk, minnesvakt och OCR-kö
+
+`regjeringen.py` extraherar proposisjoner, NOU och Meld. St. genom
+`pdftext_skydd.py` (`extrahera_pdf`, prefix `NOR`). Extraktionen körs i en
+egen process, i block om `NOR_PDF_SIDBLOCK` sidor (standard 20), och
+avbryts om den passerar `NOR_PDF_MAX_MINNE_MB` (standard 3000 MB) eller
+`NOR_PDF_TIDSGRANS_S` (standard 300 s) — ett enskilt bildtungt dokument kan
+då aldrig fälla processen. OCR-språket är `nor+eng` som standard
+(`NOR_OCR_SPRAK`), som täcker både bokmål och nynorsk (Tesseract har inga
+egna `nob`/`nno`-språkpaket).
+
+Ett block som passerar gränserna läses i stället med ren textutvinning
+(utan layout och OCR). Dokument som fick minst en sida OCR:ad, eller där
+något block föll tillbaka på ren textutvinning, läggs i OCR-kön
+(`NOR_OCR_KO_MAPP`, standard `ocr_ko/ko.jsonl` + `ocr_ko/filer/`)
+tillsammans med PDF:en, så att de kan köras genom en bättre OCR senare utan
+att laddas ned igen.
 
 ---
 
