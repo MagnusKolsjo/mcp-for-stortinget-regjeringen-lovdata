@@ -6,3 +6,6 @@ __pycache__/
 norge_cache.db
 lovdata_cache/
 *.tar.bz2
+
+# OCR-kö (pdftext_skydd.py) — köade PDF:er och deras metadata
+ocr_ko/
