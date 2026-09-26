@@ -107,9 +107,9 @@ Ordningen spelar roll; steg 3 och 4 ändrar databasen och tar tid.
 
 ---
 
-## Konfiguration i Claude Desktop
+## Konfiguration i MCP-klienten
 
-Lägg till följande i Claude Desktops MCP-konfiguration (`claude_desktop_config.json`):
+Lägg till följande i MCP-klientens konfiguration (`mcpServers`):
 
 ```json
 {

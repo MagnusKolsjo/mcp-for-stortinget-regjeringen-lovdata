@@ -11,6 +11,7 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 ## [2.0.0] — 2026-09-26
 
 ### Ändrat
+- Texterna är produktneutrala: README, konfigurationsexempel, kommentarer och äldre CHANGELOG-poster nämner MCP-klienten i stället för en viss klient.
 - User-Agent-strängen följer huvudversionen: `mcp-for-stortinget-regjeringen-lovdata/2.0`.
 - User-Agent mot regjeringen.no kan sättas med `REGJERINGEN_USER_AGENT`, så att en installation som vitlistats av regjeringen.no kan använda sin egen identifierare. README beskriver att `nor_hamta_regjeringen` kräver vitlistning.
 - **Brytande:** servern kräver MCP Python SDK 2.x (`mcp>=2.0,<3`) och bygger
