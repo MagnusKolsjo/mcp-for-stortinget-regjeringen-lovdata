@@ -8,11 +8,11 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-09-26
+
 ### Ändrat
+- User-Agent-strängen följer huvudversionen: `mcp-for-stortinget-regjeringen-lovdata/2.0`.
 - User-Agent mot regjeringen.no kan sättas med `REGJERINGEN_USER_AGENT`, så att en installation som vitlistats av regjeringen.no kan använda sin egen identifierare. README beskriver att `nor_hamta_regjeringen` kräver vitlistning.
-
-### Ändrat
-
 - **Brytande:** servern kräver MCP Python SDK 2.x (`mcp>=2.0,<3`) och bygger
   på `MCPServer`. Verktygsnamn och parametrar är oförändrade.
 - **Brytande:** http-läget kräver `MCP_API_KEY`. Utan nyckel avbryts
@@ -361,5 +361,6 @@ behöva ett nytt servernamn i konfigurationen för att se det.
 - SQLite saknar pgvector — `nor_sok_semantisk` returnerar felmeddelande om PostgreSQL inte är konfigurerat
 - Embeddingmodellen laddas lat vid första anrop för att inte blockera stdio-uppstart
 
+[2.0.0]: https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata/releases/tag/v2.0.0
 [1.1.0]: https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata/releases/tag/v1.1.0
 [1.0.0]: https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata/releases/tag/v1.0.0

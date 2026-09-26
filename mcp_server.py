@@ -104,7 +104,7 @@ log = logging.getLogger(__name__)
 
 mcp = MCPServer(
     "norge",
-    version="1.1.0",
+    version="2.0.0",
     cache_hints=CACHE_HINTAR,
     instructions=(
         "MCP-server för norsk riksdags- och rättsdata. "

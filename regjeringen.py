@@ -54,7 +54,7 @@ _SESSION = httpx.Client(
         # har vitlistat för en viss installation.
         "User-Agent": os.getenv(
             "REGJERINGEN_USER_AGENT",
-            "mcp-for-stortinget-regjeringen-lovdata/1.0 (+https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata)",
+            "mcp-for-stortinget-regjeringen-lovdata/2.0 (+https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata)",
         ),
         "Referer":    _BASE_URL,
         "Accept":     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
