@@ -9,6 +9,9 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 ## [Unreleased]
 
 ### Ändrat
+- User-Agent mot regjeringen.no kan sättas med `REGJERINGEN_USER_AGENT`, så att en installation som vitlistats av regjeringen.no kan använda sin egen identifierare. README beskriver att `nor_hamta_regjeringen` kräver vitlistning.
+
+### Ändrat
 
 - **Brytande:** servern kräver MCP Python SDK 2.x (`mcp>=2.0,<3`) och bygger
   på `MCPServer`. Verktygsnamn och parametrar är oförändrade.

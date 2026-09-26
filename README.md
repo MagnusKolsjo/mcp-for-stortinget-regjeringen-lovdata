@@ -19,7 +19,7 @@ Sökning stöder fulltextsökning (alla datakällor) och semantisk sökning med 
 | data.stortinget.no | Saker, spørsmål, høringer, vedtak, innspill (XML + metadata) | Live-API |
 | Lovdata bulk | Gällande lagar och forskrifter | Daglig synk |
 | Lovdata bulk | Norsk Lovtidend avd. I (kungjorda lagar och sentrala forskrifter, 2001–) | Daglig synk; paket som inte ändrats hoppas över |
-| regjeringen.no | Proposisjoner, NOU, Meld. St. (PDF → Markdown) | Vid anrop / DB-cache |
+| regjeringen.no | Proposisjoner, NOU, Meld. St. (PDF → Markdown) | Vid anrop / DB-cache; [kräver vitlistning](#åtkomst-till-regjeringenno-kräver-vitlistning) |
 
 ---
 
@@ -264,13 +264,39 @@ att laddas ned igen.
 
 ---
 
+## Åtkomst till regjeringen.no kräver vitlistning
+
+regjeringen.no ligger bakom Cloudflare och svarar på automatiserade anrop med
+en utmaning (HTTP 403, `cf-mitigated: challenge`) i stället för dokumentet.
+Så har det varit sedan augusti 2026. Servern känner igen utmaningen och
+förklarar den i felmeddelandet, men försöker inte ta sig förbi den.
+
+Det påverkar bara `nor_hamta_regjeringen` (proposisjoner, NOU och
+Meld. St. som PDF). Stortinget och Lovdata påverkas inte, och dokument som
+redan ligger i den lokala cachen levereras som vanligt.
+
+För att verktyget ska fungera måste regjeringen.no vitlista installationen:
+
+1. Kontakta regjeringen.no:s webbredaktion och beskriv användningen: vilka
+   dokument som hämtas, att anropen är få och glesa, och vilken User-Agent
+   och helst vilken IP-adress anropen kommer från.
+2. Ange den vitlistade identifieraren i `.env`:
+
+   ```
+   REGJERINGEN_USER_AGENT=<projektnamn>/<version> (+<url>; <kontaktadress>)
+   ```
+
+Utan vitlistning svarar verktyget med ett fel som hänvisar till
+https://www.regjeringen.no för manuell hämtning.
+
+---
+
 ## Felhantering
 
 Förväntade fel — okänd identifierare, dokument som saknas i cachen, källor
 som inte svarar eller blockerar automatiserad åtkomst — returneras som
 verktygsfel (`isError`) med ett meddelande som säger vad som gick fel och
-vad man kan göra i stället. regjeringen.no ligger bakom en Cloudflare-
-utmaning som servern känner igen och förklarar, men inte försöker passera.
+vad man kan göra i stället.
 
 Stortingets tak är 100 anrop per minut. Klienten håller sig till 90 per
 minut (`STORTINGET_RATE_LIMIT`) och respekterar `Retry-After` om källan

@@ -30,6 +30,7 @@ aldrig fälla MCP-servern på minne eller tid.
 
 import html as html_lib
 import logging
+import os
 import re
 import tempfile
 from pathlib import Path
@@ -49,7 +50,12 @@ _BASE_URL   = "https://www.regjeringen.no"
 
 _SESSION = httpx.Client(
     headers={
-        "User-Agent": "mcp-for-stortinget-regjeringen-lovdata/1.0 (+https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata)",
+        # Kan ersättas via .env, t.ex. med den identifierare som regjeringen.no
+        # har vitlistat för en viss installation.
+        "User-Agent": os.getenv(
+            "REGJERINGEN_USER_AGENT",
+            "mcp-for-stortinget-regjeringen-lovdata/1.0 (+https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata)",
+        ),
         "Referer":    _BASE_URL,
         "Accept":     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "nb,no;q=0.9,sv;q=0.8,en;q=0.7",
