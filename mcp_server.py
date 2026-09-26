@@ -78,7 +78,7 @@ NOR_TAK_TECKEN = int(os.getenv("NOR_TAK_TECKEN", "200000"))
 
 # ── Query-expansion ────────────────────────────────────────────────────────────
 # Aktiveras via QUERY_EXPANSION_ENABLED=true i .env.
-# Stöder alla OpenAI-kompatibla endpoints (Claude, OpenAI, Ollama, LM Studio).
+# Stöder alla OpenAI-kompatibla endpoints (till exempel Anthropic, OpenAI, Ollama, LM Studio).
 QUERY_EXPANSION_ENABLED     = os.getenv("QUERY_EXPANSION_ENABLED", "false").lower() == "true"
 QUERY_EXPANSION_BASE_URL    = os.getenv("QUERY_EXPANSION_BASE_URL", "")
 QUERY_EXPANSION_API_KEY     = os.getenv("QUERY_EXPANSION_API_KEY", "")
@@ -192,6 +192,9 @@ def expandera_fraga(fraga: str) -> list[str]:
     """
     if not QUERY_EXPANSION_ENABLED:
         return []
+    if not QUERY_EXPANSION_MODEL:
+        log.warning("QUERY_EXPANSION_MODEL saknas i .env; frågeexpansionen hoppas över.")
+        return []
 
     prompt_path = Path(QUERY_EXPANSION_PROMPT_FILE)
     if not prompt_path.exists():
@@ -209,7 +212,7 @@ def expandera_fraga(fraga: str) -> list[str]:
             api_key=QUERY_EXPANSION_API_KEY or "placeholder",
         )
         svar = klient.chat.completions.create(
-            model=QUERY_EXPANSION_MODEL or "claude-haiku-4-5-20251001",
+            model=QUERY_EXPANSION_MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.1,
