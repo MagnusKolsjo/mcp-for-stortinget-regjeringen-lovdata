@@ -277,9 +277,10 @@ redan ligger i den lokala cachen levereras som vanligt.
 
 För att verktyget ska fungera måste regjeringen.no vitlista installationen:
 
-1. Kontakta regjeringen.no:s webbredaktion och beskriv användningen: vilka
-   dokument som hämtas, att anropen är få och glesa, och vilken User-Agent
-   och helst vilken IP-adress anropen kommer från.
+1. Kontakta Departementenes sikkerhets- og serviceorganisasjon (DSS), som
+   driver regjeringen.no, och beskriv användningen: vilka dokument som
+   hämtas, att anropen är få och glesa, och vilken User-Agent och helst
+   vilken IP-adress anropen kommer från.
 2. Ange den vitlistade identifieraren i `.env`:
 
    ```
