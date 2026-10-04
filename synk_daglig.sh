@@ -11,7 +11,6 @@
 set -euo pipefail
 
 MAPP="$HOME/MCP-Servers/norge"
-PYTHON="${PYTHON_SOKVÄG:-$HOME/MCP-Servers/.venv/bin/python3}"
 LOGG="$MAPP/logs/synk_daglig.log"
 
 mkdir -p "$MAPP/logs"
@@ -28,6 +27,9 @@ if [ -f "$MAPP/.env" ]; then
 fi
 
 cd "$MAPP"
+
+# Välj Python-tolk efter att .env laddats, så att PYTHON_SOKVAG i .env gäller
+PYTHON="${PYTHON_SOKVAG:-$HOME/MCP-Servers/.venv/bin/python3}"
 
 # ---------------------------------------------------------------------------
 # Steg 1: Lovdata (kontrollerar SHA-256 — hoppar om tarball oförändrad)
