@@ -8,6 +8,13 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ## [Unreleased]
 
+### Fixat
+
+- Samtidiga sökanrop kunde krascha servern med SIGSEGV när embeddingmodellen kördes på
+  Apple-GPU:n (MPS). PyTorchs MPS-backend fyller sina kärncacher utan lås första gången de
+  används, och verktygen körs på parallella arbetstrådar. Alla `encode()`-anrop i processen
+  går nu genom ett gemensamt lås.
+
 ## [2.0.0] — 2026-09-26
 
 ### Ändrat
