@@ -10,6 +10,11 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ### Fixat
 
+- onnxruntime, som `pymupdf4llm` laddar för layout och OCR, skickade som standard användningsdata
+  till Microsoft (`mobile.events.data.microsoft.com`) utan att användaren tillfrågats. Telemetrin
+  stängs nu av i PDF-extraktionens barnprocess (`ORT_DISABLE_TELEMETRY=1` och
+  `disable_telemetry_events()`) innan biblioteket laddas. Det tar också bort en krasch (SIGABRT)
+  i telemetrins nedstängning när barnprocessen avslutades.
 - `CRON_SCHEMA` i `config.example.env` står inom citattecken. `synk_daglig.sh` läser `.env` med
   `source`, och ett ociterat värde med mellanslag tolkades som ett kommando: skriptet avbröts
   med "command not found" (kod 127) innan synken startade.
