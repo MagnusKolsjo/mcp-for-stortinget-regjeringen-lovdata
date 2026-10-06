@@ -8,6 +8,8 @@ Formatet följer [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) och pr
 
 ## [Unreleased]
 
+## [2.0.1] — 2026-10-06
+
 ### Fixat
 
 - onnxruntime, som `pymupdf4llm` laddar för layout och OCR, skickade som standard användningsdata
@@ -380,6 +382,7 @@ behöva ett nytt servernamn i konfigurationen för att se det.
 - SQLite saknar pgvector — `nor_sok_semantisk` returnerar felmeddelande om PostgreSQL inte är konfigurerat
 - Embeddingmodellen laddas lat vid första anrop för att inte blockera stdio-uppstart
 
+[2.0.1]: https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata/releases/tag/v2.0.1
 [2.0.0]: https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata/releases/tag/v2.0.0
 [1.1.0]: https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata/releases/tag/v1.1.0
 [1.0.0]: https://github.com/MagnusKolsjo/mcp-for-stortinget-regjeringen-lovdata/releases/tag/v1.0.0
